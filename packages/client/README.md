@@ -594,6 +594,19 @@ newest of every skill, plus every version a variation pins. `get_skill("k", vers
 version 1 even when a newer one is held. `all_skills()` and `write_skills("*")` take the newest
 version per key, since `<root>/<key>/SKILL.md` is a single path.
 
+**Skills can carry tools.** A skill's `tools` is a tuple of the tool definitions it pins, in
+the order its author set, with the same shape as a variation's `config["tools"]` entries, and
+empty when it has none. When a variation attaches skills, `config()`, `graph()` and
+`resolve_graph()` offer each skill's tools to the handler after the variation's own, in the
+variation's skills order, and skip a tool already offered with the same definition. Register
+an implementation for a skill tool in `tool_handlers` as you would for a variation tool: the
+handler receives the implementations for the variation's tools and its skills' tools, and no
+others. If a variation and one of its skills define the same tool, the variation's definition
+is used and a warning is logged. This needs a configured skill store; without one, only the
+variation's tools are offered. A tool entry without a string `name` or an object `parameters`
+is dropped with a warning, and the rest of the skill is still returned. `contentHash` covers
+only the markdown, not the tools, and `write_skills` writes no tools to disk or to the manifest.
+
 **The root's parent must exist.** `write_skills` creates the root but never its ancestors, so a
 typo cannot scatter directories across your project. A missing parent, a root that is a file,
 or a root that is a symlink raises `ValueError`. These are caller errors, distinct from the

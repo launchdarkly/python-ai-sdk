@@ -342,12 +342,13 @@ set_tool_definition_attributes(span: Any, capture: bool, tools: list[ToolDefinit
 set_usage_span_attributes(span: Any, usage: SpanUsage) -> None
 shutdown() -> None  [async]
 Skill  [class, @dataclass(frozen=True)]
-  __init__(key: str, version: int, content: bytes, content_hash: str, name: str | None = None, description: str | None = None)
+  __init__(key: str, version: int, content: bytes, content_hash: str, name: str | None = None, description: str | None = None, tools: tuple[dict[str, Any], ...] = ())
   content: bytes
   content_hash: str
   description: str | None = None
   key: str
   name: str | None = None
+  tools: tuple[dict[str, Any], ...] = field(default=(), hash=False)
   version: int
 SKILL_FILENAME = 'SKILL.md'
 skill_refs(config: AiConfigRep | None) -> list[SkillReference]

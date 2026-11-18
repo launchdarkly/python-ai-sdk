@@ -12,6 +12,7 @@ from typing import Any
 from .agui import StableProjector
 from .conversation import bind_conversation_id, bind_span_context
 from .registry import resolve_handlers, resolve_tools
+from .skills_core import config_with_skill_tools
 from .types import (
     AiConfigRep,
     GraphDefinition,
@@ -180,7 +181,7 @@ async def _build_graph(
     try:
         for node_key in all_keys:
             variation = await extract_variation(node_key, context)
-            node_config: AiConfigRep = variation["config"]
+            node_config: AiConfigRep = config_with_skill_tools(variation["config"])
             node_meta: VariationMeta = variation["meta"]
             node_values[node_key] = variation.get("value")
             node_edges = edges_from(node_key)

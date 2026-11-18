@@ -16,6 +16,7 @@ Security and telemetry contracts: ``agents.md``, *Security posture* and
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -25,7 +26,11 @@ from typing import Any, Literal, Protocol, get_args
 
 from .shutdown_hooks import register_shutdown_hook
 from .types import Skill, SkillOutcomeReason, SkillReference
-from .types_validation import is_valid_skill_key, is_valid_skill_version
+from .types_validation import (
+    is_valid_skill_key,
+    is_valid_skill_version,
+    skills_field_rejection_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,10 @@ _SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
 """What a legitimate content hash looks like. Anything else is redacted before
 it reaches telemetry, so a store cannot leak the skill body through
 ``contentHash``."""
+
+_SAFE_TOOL_NAME = re.compile(r"\A[A-Za-z0-9._-]{1,256}\Z")
+"""What a tool name must look like to be quoted in a log line; tool names are
+store-supplied, like every other field here."""
 
 _SIGNAL_INTEGRITY_FAILURE = "AgentControl Skill Integrity Failure"
 _SIGNAL_MATERIALIZED = "AgentControl Skill Materialized"
@@ -170,6 +179,9 @@ _NOOP_EMITTER: _TelemetryEmitter = _NoOpEmitter()
 _store: SkillStore | None = None
 _emitter: _TelemetryEmitter = _NOOP_EMITTER
 """Never ``None``; "no emitter" is the no-op emitter."""
+_warned_no_store_for_tools = False
+"""Whether ``config_with_skill_tools`` has already warned that no store is
+configured, so a config with skills does not warn on every call."""
 
 
 def set_store(store: Any) -> None:
@@ -186,9 +198,10 @@ def set_emitter(emitter: Any) -> None:
 
 def clear_state() -> None:
     """Drops both the store and the emitter."""
-    global _store, _emitter
+    global _store, _emitter, _warned_no_store_for_tools
     _store = None
     _emitter = _NOOP_EMITTER
+    _warned_no_store_for_tools = False
 
 
 # Registered on load, so core's ``shutdown()`` clears this state without
@@ -551,7 +564,54 @@ def verify_raw_skill(raw: Any) -> Skill | None:
         content_hash=verified.content_hash,
         name=name if isinstance(name, str) else None,
         description=description if isinstance(description, str) else None,
+        tools=parse_skill_tools(key, raw),
     )
+
+
+def _tool_label(tool: Any, index: int) -> str:
+    """How a log line names a skill tool: its name when that is safe to quote,
+    otherwise its position."""
+    name = tool.get("name") if isinstance(tool, dict) else None
+    if isinstance(name, str) and _SAFE_TOOL_NAME.match(name):
+        return f"'{name}'"
+    return f"at index {index}"
+
+
+def parse_skill_tools(key: str, raw: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """
+    The usable tool definitions in a raw skill object, in author order.
+
+    Bad tool data drops only that tool, with a warning: the skill is still
+    returned and no integrity failure is recorded, since ``contentHash`` does not
+    cover tools. An entry needs a string ``name`` and an object ``parameters``.
+    """
+    if "tools" not in raw:
+        return ()
+    raw_tools = raw["tools"]
+    if not isinstance(raw_tools, list):
+        logger.warning(
+            "Skill '%s' has tools that are not an array; none of its tools are "
+            "offered.",
+            key,
+        )
+        return ()
+    tools: list[dict[str, Any]] = []
+    for index, tool in enumerate(raw_tools):
+        if (
+            not isinstance(tool, dict)
+            or not isinstance(tool.get("name"), str)
+            or not isinstance(tool.get("parameters"), dict)
+        ):
+            logger.warning(
+                "Skill '%s' tool %s is missing a string name or an object "
+                "parameters, so it is not offered.",
+                key,
+                _tool_label(tool, index),
+            )
+            continue
+        # A copy, so a handler that edits a config's tools cannot reach the store.
+        tools.append(copy.deepcopy(tool))
+    return tuple(tools)
 
 
 def log_withholding_summary(subject: str, requested: int, resolved: int) -> None:
@@ -726,6 +786,80 @@ def resolve_from_store(
             ),
         )
     return Resolution(reason="ok", skill=skill)
+
+
+def config_with_skill_tools(config: Any) -> Any:
+    """
+    *config* with the tools of the skills it attaches added to ``tools``.
+
+    Skill tools come after the variation's own, in the variation's skills
+    order, and an exact duplicate is skipped. On a shared key the variation's
+    definition wins, and between two skills the first one does, each with a
+    warning. Never raises: a skill whose tools cannot be read adds none, and
+    *config* itself is returned when nothing is added.
+    """
+    global _warned_no_store_for_tools
+    if not isinstance(config, dict) or not config.get("skills"):
+        return config
+    refs = config["skills"]
+    rejection = skills_field_rejection_reason(refs)
+    if rejection is not None:
+        logger.warning(
+            "The AI Config's skills field is invalid (%s), so no skill tools are "
+            "offered.",
+            rejection,
+        )
+        return config
+    store = get_store()
+    if store is None:
+        if not _warned_no_store_for_tools:
+            _warned_no_store_for_tools = True
+            logger.warning(
+                "The AI Config attaches skills but no skill store is configured, "
+                "so their tools are not offered. Configure one with "
+                "set_skill_store(store)."
+            )
+        return config
+
+    own = config.get("tools")
+    own_tools: dict[str, Any] = own if isinstance(own, dict) else {}
+    merged = dict(own_tools)
+    added = False
+    for ref in refs:
+        resolution = resolve_from_store(store, ref["key"], ref["version"])
+        if resolution.skill is None:
+            logger.warning(
+                "Skill '%s' version %d is unavailable (%s), so its tools are not "
+                "offered.",
+                ref["key"],
+                ref["version"],
+                resolution.reason,
+            )
+            continue
+        for index, tool in enumerate(resolution.skill.tools):
+            name = tool["name"]
+            if name in own_tools:
+                logger.warning(
+                    "Skill '%s' and the variation both define tool %s; the "
+                    "variation's definition is used.",
+                    ref["key"],
+                    _tool_label(tool, index),
+                )
+                continue
+            if name in merged:
+                if merged[name] != tool:
+                    logger.warning(
+                        "Skill '%s' defines tool %s differently from an earlier "
+                        "skill; the earlier definition is used.",
+                        ref["key"],
+                        _tool_label(tool, index),
+                    )
+                continue
+            merged[name] = tool
+            added = True
+    if not added:
+        return config
+    return {**config, "tools": merged}
 
 
 def reference_target(item: SkillReference | str) -> tuple[str, int | None]:

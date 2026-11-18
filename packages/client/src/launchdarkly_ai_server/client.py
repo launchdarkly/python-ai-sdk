@@ -11,6 +11,7 @@ from .judges import _build_judge_tasks, run_judges
 from .lifecycle import extract_variation
 from .registry import resolve_handlers, resolve_tools
 from .sdk_usage import report_usage
+from .skills_core import config_with_skill_tools
 from .tracking import execute_and_stream, execute_and_track
 from .types import (
     AiConfigRep,
@@ -95,7 +96,7 @@ class ConfigInstance:
         resolved_tools = resolve_tools(self._registry, self._tool_handlers)
 
         variation = await self._evaluate(context)
-        config: AiConfigRep = variation["config"]
+        config: AiConfigRep = config_with_skill_tools(variation["config"])
         meta: VariationMeta = variation["meta"]
 
         if not resolved_handler_list:
@@ -215,7 +216,7 @@ class ConfigInstance:
         resolved_tools = resolve_tools(self._registry, self._tool_handlers)
 
         variation = await self._evaluate(context)
-        config: AiConfigRep = variation["config"]
+        config: AiConfigRep = config_with_skill_tools(variation["config"])
         meta: VariationMeta = variation["meta"]
 
         if not resolved_handler_list:
