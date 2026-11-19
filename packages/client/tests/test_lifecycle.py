@@ -1,5 +1,5 @@
 """
-Tests for init_client / get_client / shutdown.
+Tests for init_client / get_client / flush / shutdown.
 """
 
 import ast
@@ -1493,3 +1493,166 @@ class TestExtractVariationMissingEnabled:
             with pytest.raises(RuntimeError, match="'my-flag' is disabled"):
                 await lifecycle_module.extract_variation("my-flag", ctx)
             assert (await inspect_config("my-flag", ctx))["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# flush
+# ---------------------------------------------------------------------------
+
+
+class _BlockingEventProcessor:
+    """Stands in for ldclient's processor: its sync barrier waits on ``release``."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+
+    def _wait_until_inactive(self) -> None:
+        self.release.wait()
+
+
+class TestFlush:
+    async def test_returns_true_with_no_client(self) -> None:
+        assert await lifecycle_module.flush() is True
+
+    async def test_awaits_an_async_flush(self) -> None:
+        stub = _make_stub_client()
+        lifecycle_module._set_client_for_testing(stub)
+        assert await lifecycle_module.flush() is True
+        stub.flush.assert_awaited_once()
+        stub.close.assert_not_called()
+
+    async def test_times_out_an_async_flush(self) -> None:
+        stub = _make_stub_client()
+
+        async def never_finishes() -> None:
+            await asyncio.sleep(10)
+
+        stub.flush = never_finishes
+        lifecycle_module._set_client_for_testing(stub)
+        assert await lifecycle_module.flush(timeout=0.05) is False
+
+    async def test_waits_for_the_event_processor_barrier(self) -> None:
+        stub = MagicMock(spec=["flush", "close", "_event_processor"])
+        stub.flush = MagicMock(return_value=None)
+        stub._event_processor = _BlockingEventProcessor()
+        lifecycle_module._set_client_for_testing(stub)
+
+        task = asyncio.create_task(lifecycle_module.flush(timeout=5))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        stub._event_processor.release.set()
+        assert await task is True
+        stub.flush.assert_called_once_with()
+
+    async def test_returns_false_when_the_barrier_outlasts_the_timeout(self) -> None:
+        stub = MagicMock(spec=["flush", "close", "_event_processor"])
+        stub.flush = MagicMock(return_value=None)
+        stub._event_processor = _BlockingEventProcessor()
+        lifecycle_module._set_client_for_testing(stub)
+        try:
+            assert await lifecycle_module.flush(timeout=0.05) is False
+        finally:
+            stub._event_processor.release.set()
+
+    async def test_returns_false_when_a_sync_client_cannot_confirm(self) -> None:
+        stub = MagicMock(spec=["flush", "close"])
+        stub.flush = MagicMock(return_value=None)
+        lifecycle_module._set_client_for_testing(stub)
+        assert await lifecycle_module.flush() is False
+        stub.flush.assert_called_once_with()
+
+    async def test_rejects_a_negative_timeout(self) -> None:
+        with pytest.raises(ValueError, match="must not be negative"):
+            await lifecycle_module.flush(timeout=-1)
+
+    async def test_is_exported_from_the_package_root(self) -> None:
+        import launchdarkly_ai_server
+
+        assert launchdarkly_ai_server.flush is lifecycle_module.flush
+
+
+class TestFlushWithLDClient:
+    """Against a real ``ldclient.LDClient`` and a local events endpoint.
+
+    Pins the private ldclient barrier ``flush`` relies on: an ldclient upgrade
+    that drops it fails here instead of making ``flush`` return early.
+    """
+
+    @pytest.fixture
+    def events_server(self) -> Any:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        state: dict[str, Any] = {"bodies": [], "delay": 0.0}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                time.sleep(state["delay"])
+                if self.path == "/bulk":
+                    state["bodies"].append(json.loads(body))
+                self.send_response(202)
+                self.end_headers()
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+        server = Server(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        state["uri"] = f"http://127.0.0.1:{server.server_address[1]}"
+        yield state
+        server.shutdown()
+        server.server_close()
+
+    def _ld_client(self, events_uri: str) -> Any:
+        from ldclient.client import LDClient
+        from ldclient.config import Config
+
+        return LDClient(
+            Config(
+                "sdk-test",
+                events_uri=events_uri,
+                use_ldd=True,
+                flush_interval=600,
+                diagnostic_opt_out=True,
+                enable_event_compression=False,
+            )
+        )
+
+    async def test_returns_after_the_events_were_posted(
+        self, events_server: dict[str, Any]
+    ) -> None:
+        from ldclient import Context
+
+        client = self._ld_client(events_server["uri"])
+        try:
+            lifecycle_module._set_client_for_testing(client)
+            client.track("$ld:ai:generation:success", Context.create("user-1"), None, 1)
+            assert await lifecycle_module.flush(timeout=5) is True
+            keys = [
+                event.get("key")
+                for body in events_server["bodies"]
+                for event in body
+                if event.get("kind") == "custom"
+            ]
+            assert keys == ["$ld:ai:generation:success"]
+        finally:
+            client.close()
+
+    async def test_returns_false_while_the_post_is_still_in_flight(
+        self, events_server: dict[str, Any]
+    ) -> None:
+        from ldclient import Context
+
+        events_server["delay"] = 1.0
+        client = self._ld_client(events_server["uri"])
+        try:
+            lifecycle_module._set_client_for_testing(client)
+            client.track("$ld:ai:generation:success", Context.create("user-1"), None, 1)
+            assert await lifecycle_module.flush(timeout=0.1) is False
+        finally:
+            client.close()

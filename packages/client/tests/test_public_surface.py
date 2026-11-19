@@ -74,6 +74,7 @@ ROOT_SURFACE = frozenset(
         "execute_and_stream",
         "execute_and_track",
         "extract_variation",
+        "flush",
         "get_client",
         "global_registry",
         "graph",

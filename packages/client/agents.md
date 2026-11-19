@@ -23,7 +23,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 |---|---|
 | `src/launchdarkly_ai_server/conversation.py` | `conversation_id`, `ConversationIdSpanProcessor` — stamps `gen_ai.conversation.id` |
 | `src/launchdarkly_ai_server/sdk_info.py` | `$ld:ai:sdk:info` package registry and flush |
-| `src/launchdarkly_ai_server/lifecycle.py` | `init_client`, `get_client`, `shutdown`, `extract_variation` |
+| `src/launchdarkly_ai_server/lifecycle.py` | `init_client`, `get_client`, `flush`, `shutdown`, `extract_variation` |
 | `src/launchdarkly_ai_server/client.py` | `config()`, `ConfigInstance` |
 | `src/launchdarkly_ai_server/tracking.py` | `execute_and_track`, `execute_and_stream`, `wrap_tool_handlers`, `parse_usage` |
 | `src/launchdarkly_ai_server/graph.py` | `graph()`, `resolve_graph()`, `GraphInstance` |
@@ -915,6 +915,7 @@ When `enabled` is `False`, `config` is always `None`. When `enabled` is `True` b
 - **Explicit initialization — SDK path.** `await init_client(options?)` dynamically imports `launchdarkly-server-sdk` at runtime (optional peer dep). If the package is not installed it raises with a clear message.
 - **Explicit initialization — BYOC path.** `await init_client(client)` accepts any pre-initialized object that satisfies `LDClientInterface` — this is the path for custom or edge environments whose SDK has different init semantics.
 - `get_client()` raises `RuntimeError` if `init_client()` has not resolved.
+- `await flush(timeout)` sends queued LD events and waits until they have been sent, without closing the client or resetting state. `ldclient.LDClient.flush()` only queues the send, so `flush` waits on the event processor's private `_wait_until_inactive` barrier in a daemon thread; `TestFlushWithLDClient` pins that against a real `LDClient`. Callers must not reach into ldclient themselves.
 - `await shutdown()` must be called before process exit. It flushes OTel spans, flushes LD events, and closes the LD client. It also releases the process-global OTel tracer provider, so a later `init_client()` can install its own — `trace.set_tracer_provider` is once-guarded, and leaving it set would route every later span to the provider just torn down. Only released when this SDK's own `set_tracer_provider` actually took effect — the set is once-guarded, so when another library registered first ours is refused (a warning is emitted) and that provider is left alone rather than torn down.
 
 ---

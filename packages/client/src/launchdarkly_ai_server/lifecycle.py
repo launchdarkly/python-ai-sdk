@@ -594,6 +594,65 @@ def _flush_tracer_provider() -> None:
         logger.debug("Could not flush OpenTelemetry spans", exc_info=True)
 
 
+async def flush(timeout: float | None = 5.0) -> bool:
+    """
+    Sends the LaunchDarkly events queued on the singleton client and waits for
+    the send to finish, for at most *timeout* seconds. ``None`` waits without a
+    limit.
+
+    Returns ``True`` once everything queued before the call has been sent, and
+    ``False`` when the timeout elapsed first or the client cannot report when
+    its send finishes. With no client initialized there is nothing to send, so
+    it returns ``True``. A finished send is not necessarily an accepted one: the
+    LaunchDarkly SDK logs a rejected batch itself.
+
+    Unlike ``shutdown()``, the client stays open and no state is reset. Spans
+    are not flushed. Use it when events must leave the process before
+    something else happens, such as revoking the credential they are sent with.
+    """
+    if timeout is not None and timeout < 0:
+        raise ValueError("flush() timeout must not be negative")
+    client = _client
+    if client is None:
+        return True
+    result = client.flush()
+    if inspect.isawaitable(result):
+        try:
+            await asyncio.wait_for(result, timeout)
+        except TimeoutError:
+            return False
+        return True
+    # ldclient's flush() only queues the send. Its event processor's sync
+    # barrier (private to ldclient, so kept here) is answered after the flush
+    # workers are idle, which is after the batch queued above has been posted.
+    barrier = getattr(
+        getattr(client, "_event_processor", None), "_wait_until_inactive", None
+    )
+    if not callable(barrier):
+        return False
+    sent: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+    def wait_for_send() -> None:
+        try:
+            barrier()
+        finally:
+            try:
+                sent.set_result(None)
+            except concurrent.futures.InvalidStateError:
+                pass
+
+    # A daemon thread, not the default executor: a barrier that never answers
+    # (a closed processor) must not hold up interpreter exit.
+    threading.Thread(
+        target=wait_for_send, name="launchdarkly-ai.flush", daemon=True
+    ).start()
+    try:
+        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(sent)), timeout)
+    except TimeoutError:
+        return False
+    return True
+
+
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times

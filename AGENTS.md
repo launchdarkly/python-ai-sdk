@@ -156,6 +156,7 @@ The client manages a singleton connection to LaunchDarkly and the associated tel
 | `init_client(client=...)` | **BYOC overload** — accepts a pre-initialized `LDClientInterface`. Stores it directly without calling the SDK. Flushes pending `$ld:ai:sdk:info` events. |
 | `configure(*, options)` | Sets process-wide behavior defaults on the lifecycle singleton. `options` is a frozen `SDKOptions` (`capture_content: bool = True`). Keyword-only. Handlers read it at invocation. An explicit factory or wrapper `capture_content` overrides it, and an explicit `False` strips content everywhere, including offline evaluation spans. Replaceable until the first AI invocation; an identical value is allowed after. Not read from request data. |
 | `get_client()` | Returns the initialized `LDClientInterface`. Throws if initialization has not completed. |
+| `flush(timeout?)` | Sends queued LaunchDarkly events and waits until they have been sent, for at most `timeout` seconds (default 5, `None` for no limit). Returns `True` once sent, `False` on timeout or when the client cannot report it. Keeps the client open and resets nothing; spans are not flushed. |
 | `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. Restores the built-in SDK defaults. |
 | `register_ai_sdk_package(name, version)` | Records a LaunchDarkly AI package identity. Handler and convenience packages call this at import time. |
 

@@ -238,6 +238,7 @@ asyncio.run(main())
 | `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. Raises `RuntimeError` when the client has not initialized within 10 seconds or its SDK key was rejected; a later call retries. |
 | `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery and does not check whether that client has initialized. |
 | `get_client()` | Return the initialized `LDClientInterface`. Raises if `init_client` has not completed. |
+| `flush(timeout=5.0)` | Send queued LaunchDarkly events and wait, for at most `timeout` seconds (`None` for no limit), until they have been sent. Returns `True` once sent, `False` on timeout or when the client cannot report it. The client stays open; spans are not flushed. |
 | `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. Restores the built-in SDK defaults. |
 | `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
 

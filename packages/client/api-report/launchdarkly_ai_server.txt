@@ -79,6 +79,7 @@ ExecuteStreamDoneEvent = dict[str, Any]
 ExecuteStreamEvent = dict[str, Any]
 extract_variation(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [async]
 FDv2SkillStore = LaunchDarklySkillStore
+flush(timeout: float | None = 5.0) -> bool  [async]
 GenerationConfig(TypedDict, total=False)  [class]
   instructions: str
   messages: list[dict[str, Any]]

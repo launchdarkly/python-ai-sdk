@@ -59,6 +59,7 @@ from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
     configure,
     extract_variation,
+    flush,
     get_client,
     init_client,
     inspect_config,
@@ -270,6 +271,7 @@ __all__ = [  # noqa: RUF022
     "configure",
     "init_client",
     "get_client",
+    "flush",
     "shutdown",
     "extract_variation",
     "inspect_config",
