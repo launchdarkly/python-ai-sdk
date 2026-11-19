@@ -608,7 +608,7 @@ async def flush(timeout: float | None = 5.0) -> bool:
 
     Unlike ``shutdown()``, the client stays open and no state is reset. Spans
     are not flushed. Use it when events must leave the process before
-    something else happens, such as revoking the credential they are sent with.
+    something else happens, such as reporting a result or ending a request.
     """
     if timeout is not None and timeout < 0:
         raise ValueError("flush() timeout must not be negative")
