@@ -66,6 +66,22 @@ class TestWrapToolHandlers:
         call_args = mock_client.track.call_args
         assert call_args[0][0] == "$ld:ai:tool_call"
 
+    async def test_event_key_maps_the_tool_call_key(self) -> None:
+        mock_client = _make_mock_client()
+        with patch("launchdarkly_ai_server.lifecycle._client", mock_client):
+            wrapped = wrap_tool_handlers(
+                {"t": MagicMock(), "search": NativeTool("WebSearch")},
+                CONTEXT,
+                TRACK_DATA,
+                lambda key: f"mapped:{key}",
+            )
+            await wrapped["t"]()
+            wrapped["search"]()
+        assert [c[0][0] for c in mock_client.track.call_args_list] == [
+            "mapped:$ld:ai:tool_call",
+            "mapped:$ld:ai:tool_call",
+        ]
+
     def test_native_tool_instance_preserved_on_stub(self) -> None:
         mock_client = _make_mock_client()
         native = NativeTool("WebSearch")

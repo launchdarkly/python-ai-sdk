@@ -6,9 +6,10 @@ LaunchDarkly attaches to the matched targeting rule or the fallthrough. The serv
 variation runs exactly as ``config()`` runs it. Once it succeeds, each sampled shadow
 runs on the same input in the background, or is handed to ``on_task`` to run later with
 ``run_shadow()``. The shadow variation's judges score its response, which is then
-discarded; the shadow and its judge scores are tracked on the normal events with
-``isShadow``. These names may change in a minor release, so
-review the changelog when you upgrade.
+discarded. Every event a shadow sends, its own and its judges', is tracked under a
+``$ld:ai-shadow:`` key with ``isShadow``, never under a ``$ld:ai:`` key, so it
+counts toward no metric that reads AI Config events. These names may change in a
+minor release, so review the changelog when you upgrade.
 """
 
 from __future__ import annotations
@@ -67,6 +68,8 @@ _FALLTHROUGH = "fallthrough"
 _PENDING_SHADOWS = "__ld_pending_shadows"
 _SHADOW_ONLY_KEYS = ("tools", "shadowConfiguration")
 _BUCKET_SCALE = float(0xFFFFFFFFFFFFFFF)
+_AI_PREFIX = "$ld:ai:"
+_SHADOW_PREFIX = "$ld:ai-shadow:"
 
 
 @dataclass(frozen=True)
@@ -430,7 +433,7 @@ def _select_tasks(
 
 async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResult:
     run_id = task.track_data.get("runId")
-    extra = {k: v for k, v in task.track_data.items() if k != "runId"}
+    extra = _shadow_fields(task)
     try:
         handler = select_handler(task.shadow_config, task.shadow_meta, handlers)
         with _bound_conversation(task.conversation_id):
@@ -448,6 +451,7 @@ async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResul
                 extra_track_data=extra,
                 span_attributes=task.span_attributes,
                 feature_flag_event=False,
+                event_key=_shadow_event_key,
             )
             judge_results = await _run_judges(task, handler, handlers, result)
     except _ShadowTimeout:
@@ -487,10 +491,25 @@ async def _run_judges(
             llm_response=judge_text(response),
             base_track_data=result["track_data"],
             resolve=_extract_existing_variation,
+            event_key=_shadow_event_key,
+            judge_extra_track_data=_shadow_fields(task),
         )
     except Exception:
         logger.warning("Shadow request judges failed", exc_info=True)
         return {}
+
+
+def _shadow_event_key(key: str) -> str:
+    """The key a shadow sends in place of *key*.
+
+    ``$ld:ai:<rest>`` becomes ``$ld:ai-shadow:<rest>``, a key already under
+    ``$ld:ai-shadow:`` is kept, and any other key, such as a judge's custom
+    metric key, is prefixed with ``$ld:ai-shadow:``."""
+    if key.startswith(_SHADOW_PREFIX):
+        return key
+    if key.startswith(_AI_PREFIX):
+        return _SHADOW_PREFIX + key[len(_AI_PREFIX) :]
+    return _SHADOW_PREFIX + key
 
 
 @contextmanager
@@ -500,6 +519,12 @@ def _bound_conversation(conversation: str | None) -> Iterator[None]:
         yield
     finally:
         otel_context.detach(token)
+
+
+def _shadow_fields(task: ShadowTask) -> dict[str, Any]:
+    """The fields every shadow event carries, without the run id, which a judge
+    call's own events take from the judge call."""
+    return {k: v for k, v in task.track_data.items() if k != "runId"}
 
 
 def _failed(task: ShadowTask, error: str) -> ShadowResult:

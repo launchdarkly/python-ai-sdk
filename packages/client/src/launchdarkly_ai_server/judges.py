@@ -142,10 +142,19 @@ async def _run_judges(
     graph_key: str | None = None,
     trajectory: str = "",
     resolve: Callable[[str, LDContext], Awaitable[dict[str, Any]]],
+    event_key: Callable[[str], str] | None = None,
+    judge_extra_track_data: dict[str, Any] | None = None,
 ) -> dict[str, JudgeResult]:
     """:func:`run_judges`, resolving each judge's variation with ``resolve``.
-    A judge whose resolution raises is logged and skipped."""
-    from .tracking import execute_and_track
+    A judge whose resolution raises is logged and skipped.
+
+    *event_key* maps every key the judges send, their own model calls' and
+    their scores', before it is tracked. *judge_extra_track_data* is added to
+    the track data of each judge's own model call. Neither changes
+    ``base_track_data``, which the score events carry."""
+    from .tracking import _same_event_key, execute_and_track
+
+    to_event_key = event_key or _same_event_key
 
     judge_results: dict[str, JudgeResult] = {}
 
@@ -245,6 +254,8 @@ async def _run_judges(
                             **({"input": user_input} if user_input else {}),
                         },
                         evaluated_value=variation.get("value"),
+                        extra_track_data=judge_extra_track_data,
+                        event_key=to_event_key,
                     )
 
                     usage = to_usage_dict(result["usage"])
@@ -266,7 +277,7 @@ async def _run_judges(
                             )
                             record_evaluation(score, None, result_key)
                             client.track(
-                                entry["eventKey"],
+                                to_event_key(entry["eventKey"]),
                                 to_ld_context(client, user_context),
                                 {**base_track_data, "judgeConfigKey": result_key},
                                 score,
@@ -296,7 +307,7 @@ async def _run_judges(
 
                         client = get_client()
                         client.track(
-                            evaluation_metric_key,
+                            to_event_key(evaluation_metric_key),
                             to_ld_context(client, user_context),
                             {**base_track_data, "judgeConfigKey": judge_key},
                             score,
