@@ -431,17 +431,21 @@ class TestModelParametersForwarding:
 
         config = {
             **CONFIG,
+            "tools": {
+                "search": {"name": "search", "type": "function", "parameters": {}}
+            },
             "model": {
                 **CONFIG["model"],
                 "parameters": {
                     "model": "not-the-real-model",
                     "messages": "not-the-real-messages",
                     "system": "not-the-real-system",
+                    "tools": [{"name": "not-the-real-tool", "input_schema": {}}],
                 },
             },
         }
         h = create_claude_messages_handler()
-        await h(config, "q", {}, {})
+        await h(config, "q", {"search": lambda _: ""}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
         assert call_kwargs["model"] == CONFIG["model"]["name"]
         assert call_kwargs["messages"] != "not-the-real-messages"
@@ -449,6 +453,8 @@ class TestModelParametersForwarding:
             "system" not in call_kwargs
             or call_kwargs["system"] != "not-the-real-system"
         )
+        assert [t["name"] for t in call_kwargs["tools"]] == ["search"]
+        assert "not-the-real-tool" not in str(call_kwargs)
 
     async def test_call_unchanged_when_no_parameters_set(
         self, mock_anthropic: MagicMock
