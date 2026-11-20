@@ -300,7 +300,8 @@ class TestModelIdentity:
         for configured, expected in (
             ("Anthropic", "anthropic"),
             ("OpenAI", "openai"),
-            ("Bedrock", "bedrock"),
+            ("Bedrock", "aws.bedrock"),
+            ("bedrock", "aws.bedrock"),
             ("Azure", "azure"),
             ("", "openai"),
         ):

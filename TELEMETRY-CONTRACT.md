@@ -650,21 +650,17 @@ The two keys do not always hold the same value. In TypeScript the LangChain hand
 literal `langchain` on `gen_ai.system`, because `gen_ai.provider.name` means who served the model
 and its enumeration has no `langchain` member.
 
-Python does something different today, and this is a real behaviour change, not a port detail.
-The Python LangChain handlers set `gen_ai.system` to the configured provider name, lower-cased,
-falling back to the string `langchain` only when no provider is configured. So a Python span for
-an Anthropic-backed LangChain config currently reads `anthropic` where TypeScript reads
-`langchain`. Change Python to match TypeScript.
+Python matches TypeScript here. The Python LangChain handlers put the literal `langchain` on
+`gen_ai.system` (`LEGACY_SYSTEM` in `launchdarkly_ai_langchain_messages/spans.py`).
 
-And `gen_ai.provider.name` on the two LangChain handlers is not a passthrough of the configured
-provider. It is a binary choice: the configured name lower-cased if it equals `anthropic`,
-otherwise `openai`. Anything else, including Bedrock, Azure, Cohere, a typo, or an unset value,
-reports `openai`.
+`gen_ai.provider.name` on the two LangChain handlers is a passthrough of the configured provider
+(`serving_provider`): the name lower-cased, `openai` when it is unset or empty, with one mapping:
+a name that lower-cases to `bedrock` is written `aws.bedrock`, its semconv value. Azure, Cohere,
+a typo and any other name pass through lower-cased.
 
-That looks wrong and is deliberate. It mirrors which model class the handler actually
-instantiates, which is `ChatAnthropic` for Anthropic and `ChatOpenAI` for everything else. The
-attribute names who served the model, so it has to follow the class, not the config. Do not
-implement this as a passthrough.
+Evaluation spans write the configured provider on both keys (`_provider_name` in
+`launchdarkly_ai_server/evaluations/spans.py`): lower-cased, `aws.bedrock` for Bedrock, and
+empty, not `openai`, when no provider is configured.
 
 ---
 
