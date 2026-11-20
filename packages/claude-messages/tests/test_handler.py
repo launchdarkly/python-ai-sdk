@@ -445,7 +445,7 @@ class TestModelParametersForwarding:
             },
         }
         h = create_claude_messages_handler()
-        await h(config, "q", {}, {})
+        await h(config, "q", {"search": lambda _: ""}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
         assert call_kwargs["model"] == CONFIG["model"]["name"]
         assert call_kwargs["messages"] != "not-the-real-messages"
