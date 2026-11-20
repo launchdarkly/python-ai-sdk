@@ -808,9 +808,11 @@ def test_an_unreadable_skill_before_the_store_initializes_still_warns_after(
     cfg = _cfg(skills=[_ref("s")])
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         _config_with_skill_tools("k", cfg)
+        _config_with_skill_tools("k", cfg)
         ready = True
         _config_with_skill_tools("k", cfg)
         _config_with_skill_tools("k", cfg)
+    # One before initialization and one after, however many runs each side.
     assert len([w for w in _warnings(caplog) if "unavailable" in w]) == 2
 
 
