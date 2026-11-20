@@ -310,6 +310,14 @@ def _direct_usage(raw: Any) -> SpanUsage:
     )
 
 
+def _provider_name(config_value: AiConfigRep) -> str:
+    """The configured provider, lower-cased, with Bedrock as its semconv value ``aws.bedrock``."""
+    provider = str(
+        (config_value.get("provider") or {}).get("name") or "litellm"
+    ).lower()
+    return "aws.bedrock" if provider == "bedrock" else provider
+
+
 def _root_span(
     config_value: AiConfigRep,
     variables: dict[str, Any],
@@ -317,9 +325,7 @@ def _root_span(
     capture_content: bool = False,
 ) -> Any:
     model_name = _model_config(config_value)[0]
-    provider = str(
-        (config_value.get("provider") or {}).get("name") or "litellm"
-    ).lower()
+    provider = _provider_name(config_value)
     span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
         "invoke_agent"
     )
@@ -335,9 +341,7 @@ def _parent_context(span: Any) -> Any:
 
 def _model_span(config_value: AiConfigRep, parent: Any) -> Any:
     model_name = _model_config(config_value)[0]
-    provider = str(
-        (config_value.get("provider") or {}).get("name") or "litellm"
-    ).lower()
+    provider = _provider_name(config_value)
     span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
         f"chat {model_name}", context=parent
     )
