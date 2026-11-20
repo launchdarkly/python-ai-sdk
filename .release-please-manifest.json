@@ -1,5 +1,5 @@
 {
-  "packages/client": "1.1.0",
+  "packages/client": "1.2.0",
   "packages/ai": "1.1.0",
   "packages/claude-agents": "1.0.1",
   "packages/claude-messages": "1.1.0",
