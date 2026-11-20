@@ -198,6 +198,9 @@ class LDApiClient:
     def post(self, path: str, body: Any = None, *, idempotent: bool = False) -> Any:
         return self.request("POST", path, body=body, idempotent=idempotent)
 
+    def patch(self, path: str, body: Any = None, *, idempotent: bool = False) -> Any:
+        return self.request("PATCH", path, body=body, idempotent=idempotent)
+
 
 def segment(value: str) -> str:
     """Percent-encode one path segment."""

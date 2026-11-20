@@ -52,12 +52,18 @@ No code changes are required — `init_client()` detects the packages at runtime
 > Evaluations from Code in core. `launchdarkly-ai-python` 1.x requires
 > `launchdarkly-ai-server>=1.0.0,<2`, so upgrading `launchdarkly-ai-python` upgrades
 > `launchdarkly-ai-server` only when the installed version is outside `>=1.0.0,<2`.
+>
+> Keyed offline-evaluation reconcile (`GET` / `POST` / `PATCH` on `…/offline-evaluations`)
+> ships in a release after 1.1.0. 1.1.0 and earlier create a new evaluation on every
+> `run()` via legacy `…/evaluations`. Once that release is out, upgrade
+> `launchdarkly-ai-server` itself, because upgrading `launchdarkly-ai-python` alone can
+> leave an older one in place.
 
-The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
+The evaluations harness reads an LD-hosted dataset, reconciles a keyed offline evaluation (stable `key`), creates an API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
 Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span. The built-in default sends them. Setting capture to false removes them, including on these evaluation spans. The `$ld:ai:offline-evals:*` events still carry no transcript.
 
-Management API requests go to the `api_base_uri` option, then `LD_API_BASE_URI`, then `https://app.launchdarkly.com`; `LD_BASE_URI` is never used, because it may point at a relay proxy. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. At either level a blank value counts as unset, and a trailing `/` is stripped. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts, plus each criterion's counts and pass-rate outcome in `criteria` where LaunchDarkly reports them. When the summary reports a criterion with a pass rate threshold (every criterion has one by default, see below), the harness then waits up to 30s for LaunchDarkly's verdict on the run and returns it as `result.verdict` (`"pass"` or `"fail"`). `result.passed` follows the verdict. The run fails when any criterion's pass rate, with errored rows counted against it, is below its threshold. Criteria without a pass rate threshold are left out of the verdict. If no verdict arrives, or LaunchDarkly returns a verdict this release does not recognise, `verdict` is `None`, a warning is logged, and `passed` falls back to the row counts: the run passes only when the completed summary has no failed, error, or pending rows. A pass rate threshold of `1.0` gets the all-rows gate the same way that no threshold does. An unrecognised verdict ends the wait at once, because LaunchDarkly records a run's verdict only once. The same row rule applies when LaunchDarkly reports no pass rate threshold for the run. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
+Management API requests go to the `api_base_uri` option, then `LD_API_BASE_URI`, then `https://app.launchdarkly.com`; `LD_BASE_URI` is never used, because it may point at a relay proxy. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. At either level a blank value counts as unset, and a trailing `/` is stripped. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts, plus each criterion's counts and pass-rate outcome in `criteria` where LaunchDarkly reports them. When the summary reports a criterion with a pass rate threshold (every criterion has one by default, see below), the harness then waits up to 30s for LaunchDarkly's verdict on the run and returns it as `result.verdict` (`"pass"` or `"fail"`). `result.passed` follows the verdict. The run fails when any criterion's pass rate, with errored rows counted against it, is below its threshold. Criteria without a pass rate threshold are left out of the verdict. If no verdict arrives, or LaunchDarkly returns a verdict this release does not recognise, `verdict` is `None`, a warning is logged, and `passed` falls back to the row counts: the run passes only when the completed summary has no failed, error, or pending rows. A pass rate threshold of `1.0` gets the all-rows gate the same way that no threshold does. An unrecognised verdict ends the wait at once, because LaunchDarkly records a run's verdict only once. The same row rule applies when LaunchDarkly reports no pass rate threshold for the run. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Pass a **stable** evaluation `key` matching `^[a-z0-9][a-z0-9._-]*$` (at most 128 characters; validated before any network I/O — timestamp keys with `:` from older examples no longer work): `run()` GETs `…/offline-evaluations/{key}`, creates with POST (`key` + `name`) when missing, or always PATCHes a full config snapshot when the evaluation already exists (the server decides whether anything changed; PATCH omits `name` so a UI rename survives CI) — there is no PUT. Each call still creates a new run under the evaluation id.
 
 ```python
 import asyncio
@@ -70,7 +76,7 @@ from launchdarkly_ai_server import init_evaluations
 async def main() -> int:
     evals = init_evaluations(project_key="my-project")  # LD_API_TOKEN required; LD_SDK_KEY unless a client is already initialized
     result = await evals.run(
-        key="support-qa-2026-08-20",
+        key="support-qa",
         dataset="support-golden",
         handler=create_openai_messages_handler(),
         generation={
@@ -106,7 +112,7 @@ Pass a list of rows as `dataset`, instead of a dataset key, for datasets that li
 ```python
 result = await evals.run(
     project_key="my-project",
-    key="support-qa-2026-08-20",
+    key="support-qa",
     dataset=[
         {"input": "How do I reset my password?", "expectedOutput": "Use the reset link."},
         {"input": "Where is order {{order_id}}?", "variables": {"order_id": "A-17"}},
@@ -135,7 +141,7 @@ def mentions_policy(row: DatasetRow, output: str | None) -> float:
 
 
 result = await init_evaluations(project_key="my-project").run(
-    key="support-qa-2026-08-20",
+    key="support-qa",
     dataset="support-golden",
     # The generation config uses OpenAI and the judge uses Anthropic, so the
     # list holds a handler for each.
@@ -300,7 +306,7 @@ lookup_order_tool = EvalTool(
 )
 
 result = await evals.run(
-    key="support-qa-2026-08-20",
+    key="support-qa",
     dataset="support-golden",
     handler=create_openai_messages_handler(),
     generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
@@ -391,7 +397,7 @@ elif result and task.evaluation_metric_key:
 > **Experimental.** Import shadow requests from `launchdarkly_ai_server.experimental.shadow_requests`.
 > These names may change in a minor release, so review the changelog when you upgrade.
 
-A shadow request runs a candidate variation on real traffic without serving it. Use `shadow_config()` in place of `config()` at the call sites you want to shadow. It takes the same arguments, and `invoke()` and `stream()` return exactly what `config()` returns. When the context matches a targeting rule or the fallthrough that has shadows attached, each sampled shadow runs the same input on its own variation once the served variation succeeds. Its response is discarded. Its events are the normal `$ld:ai:*` events for that variation, with the served variation's `runId` and `isShadow: true`, so you can compare the two on the usual AI metrics. A shadow never delays or changes the served response, and its failures are only tracked.
+A shadow request runs a candidate variation on real traffic without serving it. Use `shadow_config()` in place of `config()` at the call sites you want to shadow. It takes the same arguments, and `invoke()` and `stream()` return exactly what `config()` returns. When the context matches a targeting rule or the fallthrough that has shadows attached, each sampled shadow runs the same input on its own variation once the served variation succeeds. The shadow variation's judges score its response, which is then discarded. Its events are the normal `$ld:ai:*` events for that variation, with the served variation's `runId` and `isShadow: true`, so you can compare the two on the usual AI metrics. A shadow never delays or changes the served response, and its failures are only tracked.
 
 Shadows run in the background by default, each with a 30 second limit (`shadow_timeout_s`). `shutdown()` cancels any that are still running. Pass `on_task` to run them yourself instead: it receives a picklable `ShadowTask` for each sampled shadow, and `run_shadow(task, handlers)` runs it later and never raises.
 
@@ -406,7 +412,7 @@ caller = shadow_config(key="my-ai-config", handler=handlers, on_task=queue.put_n
 shadow = await run_shadow(await queue.get(), handlers)
 ```
 
-A shadow runs as a plain `invoke()`, even when the served call streamed, with no tools and no judges. Pass handlers for every provider your shadow variations use, since a shadow with no matching handler is skipped. Plain `config()` never runs shadows.
+A shadow runs as a plain `invoke()`, even when the served call streamed, with no tools. Its own judges run on its response after it succeeds, with their usual sampling rates, and each score is tracked under the shadow variation with `isShadow: true`. Each judge that fails is logged and skipped, and the others still score. Judges use the client already set up and never start one, so they are skipped after `shutdown()`. `ShadowResult.judge_results` holds the scores, and is present only when at least one judge scored. `skip_judges` applies to the served variation only. Pass handlers for every provider your shadow variations use, since a shadow with no matching handler is skipped. Plain `config()` never runs shadows.
 
 ### `graph(key, **options)`
 
