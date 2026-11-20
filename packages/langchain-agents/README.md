@@ -141,6 +141,7 @@ asyncio.run(main())
 - Uses the system prompt and conversation history defined in your LaunchDarkly flag config.
 - Template placeholders (`{{variable}}`) in the prompt are substituted using `variables` before the call.
 - The LangGraph ReAct agent manages the full reasoning and tool-call loop autonomously — reasoning through steps, calling tools, and deciding when to stop.
+- When the provider is Bedrock, `model.region` (`us`, `global`, ...) is prepended to the model id as its cross-region inference-profile prefix: `anthropic.claude-x` with region `us` becomes `us.anthropic.claude-x`. An id that already has a prefix, an ARN, or a config without a region is sent as configured. The default chat model and a model factory (`llm` as a function) get the rewritten name; a model instance you pass is used as built.
 - Emits an OTel span and LaunchDarkly telemetry for every call.
 
 ## Choosing Between `langchain-agents` and `langchain-messages`

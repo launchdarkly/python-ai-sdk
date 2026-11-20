@@ -48,18 +48,22 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 ### Run an evaluation from code
 
-> **Requires `launchdarkly-ai-server` 1.1.0 or later** for keyed offline-evaluation
-> reconcile (`GET` / `POST` / `PATCH` on `…/offline-evaluations`). Earlier 1.0.x
-> releases create a new evaluation on every `run()` via legacy `…/evaluations`.
-> If you install `launchdarkly-ai-python`, upgrade `launchdarkly-ai-server` too,
-> because upgrading `launchdarkly-ai-python` alone can leave an older one in place:
-> `pip install --upgrade "launchdarkly-ai-server>=1.1.0"`.
+> **Requires `launchdarkly-ai-server` 1.0.0 or later.** Earlier versions do not include
+> Evaluations from Code in core. `launchdarkly-ai-python` 1.x requires
+> `launchdarkly-ai-server>=1.0.0,<2`, so upgrading `launchdarkly-ai-python` upgrades
+> `launchdarkly-ai-server` only when the installed version is outside `>=1.0.0,<2`.
+>
+> Keyed offline-evaluation reconcile (`GET` / `POST` / `PATCH` on `…/offline-evaluations`)
+> ships in a release after 1.1.0. 1.1.0 and earlier create a new evaluation on every
+> `run()` via legacy `…/evaluations`. Once that release is out, upgrade
+> `launchdarkly-ai-server` itself, because upgrading `launchdarkly-ai-python` alone can
+> leave an older one in place.
 
 The evaluations harness reads an LD-hosted dataset, reconciles a keyed offline evaluation (stable `key`), creates an API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
 Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span. The built-in default sends them. Setting capture to false removes them, including on these evaluation spans. The `$ld:ai:offline-evals:*` events still carry no transcript.
 
-Management API requests go to the `api_base_uri` option, then `LD_API_BASE_URI`, then `https://app.launchdarkly.com`; `LD_BASE_URI` is never used, because it may point at a relay proxy. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. At either level a blank value counts as unset, and a trailing `/` is stripped. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts, plus each criterion's counts and pass-rate outcome in `criteria` where LaunchDarkly reports them. When the summary reports a criterion with a pass rate threshold (every criterion has one by default, see below), the harness then waits up to 30s for LaunchDarkly's verdict on the run and returns it as `result.verdict` (`"pass"` or `"fail"`). `result.passed` follows the verdict. The run fails when any criterion's pass rate, with errored rows counted against it, is below its threshold. Criteria without a pass rate threshold are left out of the verdict. If no verdict arrives, or LaunchDarkly returns a verdict this release does not recognise, `verdict` is `None`, a warning is logged, and `passed` falls back to the row counts: the run passes only when the completed summary has no failed, error, or pending rows. A pass rate threshold of `1.0` gets the all-rows gate the same way that no threshold does. An unrecognised verdict ends the wait at once, because LaunchDarkly records a run's verdict only once. The same row rule applies when LaunchDarkly reports no pass rate threshold for the run. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Pass a **stable** evaluation `key` matching `^[a-z0-9][a-z0-9._-]*$` (at most 128 characters; validated before any network I/O — timestamp keys with `:` from older examples no longer work): `run()` GETs `…/offline-evaluations/{key}`, creates with POST (`key` + `name`) when missing, or always PATCHes a full config snapshot when the evaluation already exists (the server decides whether anything changed; PATCH omits `name` so a UI rename survives CI) — there is no PUT. Each call still creates a new run under the evaluation id.
+Management API requests go to the `api_base_uri` option, then `LD_API_BASE_URI`, then `https://app.launchdarkly.com`; `LD_BASE_URI` is never used, because it may point at a relay proxy. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. At either level a blank value counts as unset, and a trailing `/` is stripped. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts, plus each criterion's counts and pass-rate outcome in `criteria` where LaunchDarkly reports them. When the summary reports a criterion with a pass rate threshold (every criterion has one by default, see below), the harness then waits up to 30s for LaunchDarkly's verdict on the run and returns it as `result.verdict` (`"pass"` or `"fail"`). `result.passed` follows the verdict. The run fails when any criterion's pass rate, with errored rows counted against it, is below its threshold. Criteria without a pass rate threshold are left out of the verdict. If no verdict arrives, or LaunchDarkly returns a verdict this release does not recognise, `verdict` is `None`, a warning is logged, and `passed` falls back to the row counts: the run passes only when the completed summary has no failed, error, or pending rows. A pass rate threshold of `1.0` gets the all-rows gate the same way that no threshold does. An unrecognised verdict ends the wait at once, because LaunchDarkly records a run's verdict only once. The same row rule applies when LaunchDarkly reports no pass rate threshold for the run. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Pass a **stable** evaluation `key` matching `^[a-z0-9][a-z0-9._-]*$` (at most 128 characters; validated before any network I/O — timestamp keys with `:` from older examples no longer work): `run()` GETs `…/offline-evaluations/{key}`, creates with POST (`key` + `name`) when missing, or always PATCHes a full config snapshot when the evaluation already exists (the server decides whether anything changed; PATCH omits `name` so a UI rename survives CI) — there is no PUT. The PATCH is retried on a 5xx or a transport failure, since replaying the same snapshot changes nothing. A 409 conflict re-GETs the evaluation and PATCHes once more; a second 409 raises `EvaluationsError`. Each call still creates a new run under the evaluation id.
 
 ```python
 import asyncio
@@ -97,7 +101,7 @@ sys.exit(asyncio.run(main()))
 
 **Pass one handler as `handler` or a list as `handlers`, not both.** Each handler must declare `provides_for`; the provider packages' `create_*_handler()` factories and `create_handler()` set it. The generation config and every judge select a handler from the list by provider and mode, with the same rule as `config()`: a handler that names the provider wins over a `"*"` handler, and the mode must match exactly. To evaluate your own application code, wrap it with `create_handler((provider, mode), fn)`.
 
-**Start from an AI Config.** Pass `ai_config=AIConfig(key=..., variation=...)` instead of a full `generation`. The harness reads the AI Config's mode first, then the variation, then the model config it links, and runs each check as soon as the read that supplies its input returns. The mode selects the prompt field: `instructions` in agent mode, `messages` in completion and judge mode. `generation` can then override single fields, except `mode`. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
+**Start from an AI Config.** Pass `ai_config=AIConfig(key=..., variation=...)` instead of a full `generation`. The harness reads the AI Config's mode first, then the variation, then the model config it links, and runs each check as soon as the read that supplies its input returns. The mode selects the prompt field: `instructions` in agent mode, `messages` in completion and judge mode. `generation` can then override single fields, except `mode`. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests. To retry a failed model request, pass `max_retries` to the messages handler factory (`create_openai_messages_handler(max_retries=5)`, and likewise for the Claude, LangChain and LiteLLM messages handlers): the provider client retries inside the one invocation.
 
 Generation and criterion events are the only path by which row results reach LaunchDarkly, so `init_evaluations()` raises rather than creating a run that can never complete unless it can resolve an event transport: either an SDK key (`sdk_key` or `LD_SDK_KEY`) or a client already initialized through `init_client(client=...)`. Bringing your own client lets a process emit evaluation events without an SDK key in scope. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint until row accounting shows processing is complete.
 
@@ -158,7 +162,7 @@ result = await init_evaluations(project_key="my-project").run(
 
 A judge is shown the tool calls the row made on the way to its output, so a rubric can grade *how* the agent answered and not only *what* it answered — whether it called the right tool, in the right order, with the right arguments, and how it handled a tool that failed.
 
-The harness records this itself: it wraps your tool implementations once per row before handing them to the handler, so every handler package is covered without changes and your tools still return and raise exactly what they did before.
+The harness records this itself: it wraps your tool implementations once per row before handing them to the handler, so every handler package is covered without changes. A tool that returns is unchanged. A tool that raises does not fail the row: the model receives `Error: <ExceptionType>: <message>` as that tool's result and carries on, and the trajectory records the call as an error. Each implementation is called with the model's arguments as one `dict`.
 
 **This is not specific to offline evaluations.** Online judges — both the inline ones sampled by `config().invoke()` and the deferred ones you run from a `JudgeTask` on a background thread — are shown the same trajectory, built by the same function. See [Judges see one conversation](#judges-see-one-conversation).
 
@@ -280,8 +284,8 @@ Pass `tools` to `run()` as a list of `EvalTool`. Construct one to define a tool 
 from launchdarkly_ai_server import EvalTool, init_evaluations
 
 
-def lookup_order(order_id: str) -> str:
-    return f"order {order_id} shipped"
+def lookup_order(args: dict) -> str:
+    return f"order {args['order_id']} shipped"
 
 
 evals = init_evaluations(project_key="my-project")
@@ -317,6 +321,8 @@ result = await evals.run(
 ### `config(**args)`
 
 The primary entry point for AI config invocations. Accepts either a single handler or a list of handlers and routes to the correct one at invoke-time based on the flag variation's provider and mode.
+
+Only the tools attached to the variation are offered to the model, and only those with an implementation in `tool_handlers`. If the model names a tool it was not offered, the call raises `ValueError: No handler registered for tool "<name>"`. A tool implementation receives the model's arguments as one `dict`.
 
 ```python
 import asyncio
@@ -506,9 +512,9 @@ asyncio.run(main())
 ### Agent Skills
 
 > **Requires `launchdarkly-ai-server` 1.0.0 or later.** Earlier versions do not include Agent
-> Skills in core. If you install `launchdarkly-ai-python`, upgrade `launchdarkly-ai-server` too,
-> because upgrading `launchdarkly-ai-python` alone can leave an older one in place:
-> `pip install --upgrade "launchdarkly-ai-server>=1.0.0"`.
+> Skills in core. `launchdarkly-ai-python` 1.x requires `launchdarkly-ai-server>=1.0.0,<2`, so
+> upgrading `launchdarkly-ai-python` upgrades `launchdarkly-ai-server` only when the installed
+> version is outside `>=1.0.0,<2`.
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their
