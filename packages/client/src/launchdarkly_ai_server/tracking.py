@@ -59,10 +59,15 @@ def _try_get_environment_id() -> str | None:
     return os.environ.get("LD_ENVIRONMENT_ID") or None
 
 
+def _same_event_key(key: str) -> str:
+    return key
+
+
 def wrap_tool_handlers(
     tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
     user_context: LDContext,
     track_data: TrackData,
+    event_key: Callable[[str], str] | None = None,
 ) -> dict[str, Callable[..., Any]]:
     """
     Wraps each tool handler so that invoking it emits a ``$ld:ai:tool_call``
@@ -74,9 +79,14 @@ def wrap_tool_handlers(
       so handler packages can recover the provider tool name.
     - Tools whose name starts with ``__handoff_`` skip tracking (synthetic
       graph-routing tools must not pollute ``$ld:ai:tool_call`` metrics).
+
+    *event_key* maps the event key before it is tracked, as in
+    ``execute_and_track``.
     """
     if not tool_handlers:
         return {}
+
+    tool_call_key = (event_key or _same_event_key)("$ld:ai:tool_call")
 
     from .lifecycle import get_client  # late import to avoid circular deps
 
@@ -91,7 +101,7 @@ def wrap_tool_handlers(
             ) -> Callable[..., Any]:
                 def stub(*args: Any, **kwargs: Any) -> None:
                     get_client().track(
-                        "$ld:ai:tool_call",
+                        tool_call_key,
                         user_context,
                         {**track_data, "toolKey": tool_name},
                         1,
@@ -118,7 +128,7 @@ def wrap_tool_handlers(
 
                 async def wrapper(*args: Any, **kwargs: Any) -> Any:
                     get_client().track(
-                        "$ld:ai:tool_call",
+                        tool_call_key,
                         user_context,
                         {**track_data, "toolKey": tool_name},
                         1,
@@ -245,14 +255,17 @@ async def execute_and_track(
     span_attributes: dict[str, Any] | None = None,
     feature_flag_event: bool = True,
     evaluated_value: Any = None,
+    event_key: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """
     Calls *handler*, emits LD telemetry events, and returns
     ``{usage, response, track_data}``. *evaluated_value* is the variation as
     the LD SDK returned it; with content capture on it becomes the root
     span's ``feature_flag.result.value``. ``feature_flag_event=False`` keeps
-    the ``feature_flag`` event off the handler's root span.
+    the ``feature_flag`` event off the handler's root span. *event_key* maps
+    each event key before it is tracked; by default every key is sent as is.
     """
+    event_key = event_key or _same_event_key
     from .lifecycle import get_client
 
     track_data = make_track_data(
@@ -278,6 +291,7 @@ async def execute_and_track(
         recorder.wrap(tool_handlers, exposed=exposed_tool_keys),
         ld_ctx,
         track_data,
+        event_key,
     )
     merged_variables: dict[str, Any] = {
         **_without_span_attributes(variables),
@@ -302,22 +316,28 @@ async def execute_and_track(
         )
     except Exception:
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
-        client.track("$ld:ai:duration:total", ld_ctx, track_data, elapsed_ms)
-        client.track("$ld:ai:generation:error", ld_ctx, track_data, 1)
+        client.track(event_key("$ld:ai:duration:total"), ld_ctx, track_data, elapsed_ms)
+        client.track(event_key("$ld:ai:generation:error"), ld_ctx, track_data, 1)
         raise
 
     elapsed_ms = int((time.monotonic() - start_time) * 1000)
-    client.track("$ld:ai:duration:total", ld_ctx, track_data, elapsed_ms)
-    client.track("$ld:ai:generation:success", ld_ctx, track_data, 1)
+    client.track(event_key("$ld:ai:duration:total"), ld_ctx, track_data, elapsed_ms)
+    client.track(event_key("$ld:ai:generation:success"), ld_ctx, track_data, 1)
 
     usage = parse_usage(result.get("usage") or {})
 
     if usage["total"] > 0:
-        client.track("$ld:ai:tokens:total", ld_ctx, track_data, usage["total"])
+        client.track(
+            event_key("$ld:ai:tokens:total"), ld_ctx, track_data, usage["total"]
+        )
     if usage["input"] > 0:
-        client.track("$ld:ai:tokens:input", ld_ctx, track_data, usage["input"])
+        client.track(
+            event_key("$ld:ai:tokens:input"), ld_ctx, track_data, usage["input"]
+        )
     if usage["output"] > 0:
-        client.track("$ld:ai:tokens:output", ld_ctx, track_data, usage["output"])
+        client.track(
+            event_key("$ld:ai:tokens:output"), ld_ctx, track_data, usage["output"]
+        )
 
     raw_output = result.get("output")
     response = raw_output if raw_output is not None else ""
