@@ -798,6 +798,41 @@ async def test_a_routed_graph_node_keeps_its_own_skill_and_handoff_tools(
         assert "get-weather" not in cfg["tools"] and "get-weather" not in handlers
 
 
+@pytest.mark.parametrize("edit", ["in_place", "replaced"])
+async def test_an_edited_resolved_node_runs_with_its_edit_and_its_skill_tools(
+    mock_ld_client: Any, edit: str
+) -> None:
+    """Editing ``GraphNode.config`` after ``resolve_graph`` takes effect in
+    ``run_node`` and ``route``, and the skill tools are still merged in."""
+    set_skill_store(_store(_envelope("s", tools=[_tool("t")])))
+
+    async def variation(key: str, ctx: Any, default: Any) -> Any:
+        if key == "graph-key":
+            return {"root": "root", "edges": {"root": [{"key": "a"}, {"key": "b"}]}}
+        return _variation(skills=[_ref("s")])
+
+    mock_ld_client.variation = AsyncMock(side_effect=variation)
+    seen: list[tuple[Any, dict[str, Any]]] = []
+    definition = await resolve_graph(
+        "graph-key", context=CONTEXT, handlers=[_capturing_handler(seen)]
+    )
+    assert definition.root is not None
+    node = definition.get_node("a")
+    assert node is not None
+    for target in (definition.root, node):
+        if edit == "in_place":
+            target.config["instructions"] = "updated"
+        else:
+            target.config = {**target.config, "instructions": "updated"}
+
+    await definition.run_node(node, "hi")
+    await definition.route(definition.root, "hi")
+    assert len(seen) == 2
+    for cfg, _ in seen:
+        assert cfg["instructions"].startswith("updated")
+        assert "t" in cfg["tools"]
+
+
 def test_an_unreadable_skill_before_the_store_initializes_still_warns_after(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
