@@ -353,6 +353,7 @@ def _shadow_variation(
         )
     except RuntimeError:
         return None
+    # No skill tools either: a shadow runs with no tools (README), and tool_handlers=None.
     return parsed["config"], parsed["meta"]
 
 

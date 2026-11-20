@@ -5,6 +5,8 @@ Tests for the native graph adapter (to_openai_agents) and OpenAI-specific specs.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from collections.abc import Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,7 +17,14 @@ from launchdarkly_ai_openai_agents.native_graph import (
     _build_node_tools,
     to_openai_agents,
 )
-from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, NativeTool
+from launchdarkly_ai_server import (
+    GraphDefinition,
+    GraphEdge,
+    GraphNode,
+    InMemorySkillStore,
+    NativeTool,
+    set_skill_store,
+)
 from tests.forwarding_spec import (
     OPENAI_AGENTS,
     candidate_keys,
@@ -1357,3 +1366,174 @@ class TestNodeToolsFailClosed:
             },
         )
         assert [t.name for t in tools] == ["safe"]
+
+
+_WEATHER_SKILL_BODY = "---\nname: W\n---\nWeather.\n"
+
+
+@pytest.fixture
+def weather_skill_store() -> Iterator[None]:
+    """A store holding skill ``weather`` v1, which pins the ``get-weather`` tool."""
+    set_skill_store(
+        InMemorySkillStore(
+            {
+                "weather:1": {
+                    "key": "weather",
+                    "version": 1,
+                    "content": _WEATHER_SKILL_BODY,
+                    "contentHash": hashlib.sha256(
+                        _WEATHER_SKILL_BODY.encode()
+                    ).hexdigest(),
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get-weather",
+                            "description": "d",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    try:
+        yield
+    finally:
+        # set_skill_store(None) is a no-op by design; clear the store itself.
+        from launchdarkly_ai_server.skills_core import clear_state
+
+        clear_state()
+
+
+@pytest.mark.asyncio
+async def test_native_graph_adapters_offer_a_nodes_skill_tools(
+    weather_skill_store: None,
+) -> None:
+    """TESTING.md §3.21a: the root attaches the weather skill and gets ``get-weather`` beside its
+    own tool and its handoff; the child does not attach it and does not get it."""
+    from agents import FunctionTool
+
+    agents_mock = _make_agents_mock(_make_run_result("out"))
+    agents_mock.FunctionTool = FunctionTool
+    child = {
+        "key": "child",
+        "config": {
+            "model": {"name": "gpt-4o"},
+            "provider": {"name": "OpenAI"},
+            "instructions": "child",
+            "tools": {"leaf-tool": {"description": "d", "parameters": {}}},
+        },
+        "meta": {},
+        "edges": [],
+        "is_terminal": True,
+    }
+    root = {
+        "key": "root",
+        "config": {
+            "model": {"name": "gpt-4o"},
+            "provider": {"name": "OpenAI"},
+            "instructions": "root",
+            "tools": {"lookup": {"description": "d", "parameters": {}}},
+            "skills": [{"key": "weather", "version": 1}],
+        },
+        "meta": {},
+        "edges": [{"source_key": "root", "target_key": "child"}],
+        "is_terminal": False,
+    }
+    graph_def = _make_graph_def(
+        nodes={"root": root, "child": child},
+        edges=[{"source_key": "root", "target_key": "child"}],
+    )
+
+    with patch(
+        "importlib.import_module",
+        side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+    ):
+        await to_openai_agents(
+            _make_def_promise(graph_def),
+            opts={
+                "tool_handlers": {
+                    "get-weather": lambda a: "sunny",
+                    "lookup": lambda a: "found",
+                    "leaf-tool": lambda a: "leafed",
+                }
+            },
+        ).invoke("hi")
+
+    by_name = {a.name: a._kw for a in agents_mock._created_agents}
+    assert sorted(by_name) == ["child", "root"]
+    root_kw, child_kw = by_name["root"], by_name["child"]
+    # The root keeps its own tool, gains the skill's, and keeps its handoff to the child.
+    assert [t.name for t in root_kw["tools"]] == ["lookup", "get-weather"]
+    assert [h.name for h in root_kw["handoffs"]] == ["child"]
+    # The child does not attach the skill, so it is offered only its own tool.
+    assert [t.name for t in child_kw["tools"]] == ["leaf-tool"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("premerged", [False, True], ids=["unmerged", "merged"])
+async def test_native_graph_adapters_merge_skill_tools_once(
+    weather_skill_store: None,
+    premerged: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """TESTING.md §3.21a, *Skill tools are merged once*: the adapter always calls the merge. An
+    unmerged config (a Python public graph node) is merged, reading the skill once. A config
+    core already merged is used as is: no second read, and no variation/skill conflict warning
+    for the skill tool already in its tools."""
+    from agents import FunctionTool
+
+    from launchdarkly_ai_server import _config_with_skill_tools
+    from launchdarkly_ai_server.skills_core import get_store
+
+    config: dict[str, Any] = {
+        "model": {"name": "gpt-4o"},
+        "provider": {"name": "OpenAI"},
+        "instructions": "root",
+        "tools": {"lookup": {"description": "d", "parameters": {}}},
+        "skills": [{"key": "weather", "version": 1}],
+    }
+    if premerged:
+        config = _config_with_skill_tools("root", config)  # type: ignore[arg-type, assignment]
+    store = get_store()
+    assert store is not None
+    reads: list[str] = []
+    real_get = store.get_object
+
+    def counting_get(kind: str, key: str, version: Any = None) -> Any:
+        reads.append(key)
+        return real_get(kind, key, version)
+
+    store.get_object = counting_get  # type: ignore[method-assign]
+    agents_mock = _make_agents_mock(_make_run_result("out"))
+    agents_mock.FunctionTool = FunctionTool
+    root = {
+        "key": "root",
+        "config": config,
+        "meta": {},
+        "edges": [],
+        "is_terminal": True,
+    }
+    graph_def = _make_graph_def(nodes={"root": root}, edges=[])
+
+    with (
+        caplog.at_level("WARNING"),
+        patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ),
+    ):
+        await to_openai_agents(
+            _make_def_promise(graph_def),
+            opts={
+                "tool_handlers": {
+                    "get-weather": lambda a: "sunny",
+                    "lookup": lambda a: "found",
+                }
+            },
+        ).invoke("hi")
+
+    (root_kw,) = [a._kw for a in agents_mock._created_agents]
+    assert [t.name for t in root_kw["tools"]] == ["lookup", "get-weather"]
+    assert reads == ([] if premerged else ["weather"])
+    assert not [r for r in caplog.records if "both define tool" in r.getMessage()]

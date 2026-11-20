@@ -84,6 +84,7 @@ from .skills import (
 )
 from .skills import _skill_refs as _skill_refs
 from .skills_core import SkillStore
+from .skills_core import _config_with_skill_tools as _config_with_skill_tools
 from .skills_fdv2 import LaunchDarklySkillStore, StoreDiagnostics
 from .skills_fs import (
     MANIFEST_FILENAME,

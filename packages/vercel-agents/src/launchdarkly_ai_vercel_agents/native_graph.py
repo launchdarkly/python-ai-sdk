@@ -16,6 +16,7 @@ from launchdarkly_ai_server import (
     LDContext,
     NativeGraphRunner,
     NativeTool,
+    _config_with_skill_tools,
     get_client,
     make_track_data,
     report_usage,
@@ -132,7 +133,11 @@ def to_vercel_agents(
             selected[node.key] = None
             model = await resolve_model(model_source, node.config, ai)
             models[node.key] = model
-            tools = build_agent_tools(node.config.get("tools"), tool_handlers, ai)
+            tools = build_agent_tools(
+                _config_with_skill_tools(node.key, node.config).get("tools"),
+                tool_handlers,
+                ai,
+            )
             for edge in definition.edges_from(node.key):
                 tools.append(
                     _handoff_tool(
