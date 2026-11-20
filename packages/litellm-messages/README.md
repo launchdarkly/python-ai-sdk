@@ -40,5 +40,13 @@ containing an ARN is sent as configured. Tool calls,
 structured output, multimodal history, and streaming are supported without
 constructing a provider-native client.
 
+Only the tools attached to the variation are offered to the model, and only those with a function in `tool_handlers`; a `NativeTool` is never offered. If the model names a tool it was not offered, the call raises `ValueError: No handler registered for tool "<name>"`. A tool implementation receives the model's arguments as one `dict`.
+
+## Retries
+
+`create_litellm_messages_handler(max_retries=...)` sets how many times a failed request is retried before the error reaches the handler. It is passed to `acompletion` on every model turn: as `max_retries` for `openai` and `azure` models, which go through LiteLLM's OpenAI client, and as `num_retries`, LiteLLM's own retry loop, for every other provider. `None`, the default, passes neither, so LiteLLM's default applies. A negative or non-integer value raises when the handler is built.
+
+## Registering
+
 Because this is a wildcard messages handler, do not register it together with
 another `["*", "messages"]` handler such as LangChain in the same registry.

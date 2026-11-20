@@ -195,6 +195,8 @@ Use `create_handler(provides_for, fn)` to build a custom handler. It attaches ro
 
 Returns a `ConfigInstance` with `.invoke(user_input, context, variables?)` and `.stream(user_input, context, variables?)`.
 
+Only the tools attached to the variation are offered to the model, and only those with an implementation in `tool_handlers`. If the model names a tool it was not offered, the call raises `ValueError: No handler registered for tool "<name>"`. A tool implementation receives the model's arguments as one `dict`.
+
 ```python
 import asyncio
 from launchdarkly_ai_server import config, create_handler, shutdown
