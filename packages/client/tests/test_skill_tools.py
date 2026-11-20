@@ -689,7 +689,7 @@ class TestOfferingSkillTools:
         set_skill_store(_store(_envelope("a", tools=[_tool("a1")])))
         cfg = _cfg()
         cfg["skills"] = skills
-        assert _config_with_skill_tools("k", cfg) is cfg
+        assert _config_with_skill_tools("k", cfg) == cfg
 
     async def test_inspect_config_returns_only_the_variations_own_tools(
         self, mock_ld_client: Any
@@ -825,3 +825,71 @@ async def test_a_257_character_tool_name_is_not_quoted(
         await get_skill(SKILL)
     text = "\n".join(_warnings(caplog))
     assert "tools[0]" in text and long_name not in text
+
+
+class TestSkillToolsAreMergedOnce:
+    """TESTING.md §3.21a, *Skill tools are merged once*."""
+
+    @staticmethod
+    def _counting_store(
+        *envelopes: dict[str, Any],
+    ) -> tuple[InMemorySkillStore, list[str]]:
+        store = _store(*envelopes)
+        reads: list[str] = []
+        real_get = store.get_object
+
+        def counting_get(kind: str, key: str, version: int | None = None) -> Any:
+            reads.append(key)
+            return real_get(kind, key, version)
+
+        store.get_object = counting_get  # type: ignore[method-assign]
+        return store, reads
+
+    def test_an_unmerged_config_is_merged(self) -> None:
+        store, reads = self._counting_store(_envelope("s", tools=[_tool("t")]))
+        set_skill_store(store)
+        cfg = _cfg(tools={"own": _tool("own")}, skills=[_ref("s")])
+        merged = _config_with_skill_tools("k", cfg)
+        assert list(merged["tools"]) == ["own", "t"]
+        assert reads == ["s"]
+        # The variation's config is not changed.
+        assert list(cfg["tools"]) == ["own"]
+
+    @pytest.mark.parametrize(
+        "with_skill_tools", [True, False], ids=["added", "none-added"]
+    )
+    def test_a_second_call_returns_the_config_unchanged_without_reading(
+        self, with_skill_tools: bool
+    ) -> None:
+        tools = [_tool("t")] if with_skill_tools else []
+        store, reads = self._counting_store(_envelope("s", tools=tools))
+        set_skill_store(store)
+        merged = _config_with_skill_tools("k", _cfg(skills=[_ref("s")]))
+        reads.clear()
+        assert _config_with_skill_tools("k", merged) is merged
+        assert reads == []
+
+    def test_a_second_pass_logs_no_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A merged config already holds each skill tool, so merging it again would warn as for
+        a variation/skill conflict. The mark stops that, and also stops a repeat of a warning
+        that is not deduplicated, such as an invalid skills field."""
+        set_skill_store(_store(_envelope("s", tools=[_tool("t")])))
+        merged = _config_with_skill_tools("k", _cfg(skills=[_ref("s")]))
+        invalid = _cfg()
+        invalid["skills"] = "a"
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            first_invalid = _config_with_skill_tools("k", invalid)
+            caplog.clear()
+            _config_with_skill_tools("k", merged)
+            _config_with_skill_tools("k", first_invalid)
+        assert _warnings(caplog) == []
+
+    def test_the_mark_is_not_a_key(self) -> None:
+        """Handlers and inspect_config see only the config's own fields."""
+        set_skill_store(_store(_envelope("s", tools=[_tool("t")])))
+        cfg = _cfg(skills=[_ref("s")])
+        merged = _config_with_skill_tools("k", cfg)
+        assert set(merged) == set(cfg) | {"tools"}
+        assert isinstance(merged, dict)

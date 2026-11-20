@@ -22,7 +22,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, get_args
+from typing import Any, Literal, Protocol, cast, get_args
 
 from .shutdown_hooks import register_shutdown_hook
 from .types import AiConfigRep, Skill, SkillOutcomeReason, SkillReference
@@ -822,6 +822,16 @@ def _same_tool(a: dict[str, Any], b: dict[str, Any]) -> bool:
     )
 
 
+class _SkillToolsMerged(dict):  # type: ignore[type-arg]
+    """A config ``_config_with_skill_tools`` has returned. The class is the
+    merge mark: it adds no key, so handlers and ``inspect_config`` see a plain
+    config, and a copy made with ``dict(...)`` or ``{**...}`` drops it."""
+
+
+def _merged(config: AiConfigRep) -> AiConfigRep:
+    return cast(AiConfigRep, _SkillToolsMerged(config))
+
+
 def _config_with_skill_tools(config_key: str, config: AiConfigRep) -> AiConfigRep:
     """
     *config* with the tools of the skills it attaches added to ``tools``.
@@ -829,12 +839,20 @@ def _config_with_skill_tools(config_key: str, config: AiConfigRep) -> AiConfigRe
     Skill tools come after the variation's own, in the variation's skills
     order, and an exact duplicate is skipped. On a shared key the variation's
     definition wins, and between two skills the first one does, each with a
-    warning. Never raises: a skill that cannot be read adds no tools, no store
-    means no skill tools, and *config* itself is returned when nothing is added.
-    Reads through core retrieval, so it reports no accessor usage.
+    warning. Never raises: a skill that cannot be read adds no tools, and no
+    store means no skill tools.
+
+    The returned config is marked as merged, and a marked config is returned
+    as is, reading no skill and logging nothing. So a caller always calls this
+    and never decides for itself whether a config still needs merging: merging
+    twice would see each skill tool in ``tools`` already and warn as for a
+    variation-skill conflict. Reads through core retrieval, so it reports no
+    accessor usage.
     """
-    if not isinstance(config, dict) or not config.get("skills"):
+    if isinstance(config, _SkillToolsMerged) or not isinstance(config, dict):
         return config
+    if not config.get("skills"):
+        return _merged(config)
     refs = config["skills"]
     rejection = skills_field_rejection_reason(refs)
     if rejection is not None:
@@ -844,11 +862,11 @@ def _config_with_skill_tools(config_key: str, config: AiConfigRep) -> AiConfigRe
             config_key,
             rejection,
         )
-        return config
+        return _merged(config)
     store = get_store()
     if store is None:
         # Skills may be attached for write_skills alone, so this is not an error.
-        return config
+        return _merged(config)
 
     own = config.get("tools")
     own_tools: dict[str, Any] = own if isinstance(own, dict) else {}
@@ -898,8 +916,8 @@ def _config_with_skill_tools(config_key: str, config: AiConfigRep) -> AiConfigRe
                 merged[name] = tool
                 first_from[name] = f"'{skill_key}' version {version}"
     if not first_from:
-        return config
-    return {**config, "tools": merged}
+        return _merged(config)
+    return _merged({**config, "tools": merged})
 
 
 def reference_target(item: SkillReference | str) -> tuple[str, int | None]:
