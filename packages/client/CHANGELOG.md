@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.1.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-1.0.0...launchdarkly-ai-server-1.1.0) (2026-11-12)
+
+
+### Experimental
+
+* **shadow-requests:** add experimental shadow_config wrapper ([#250](https://github.com/launchdarkly/python-ai-sdk/issues/250)) ([8b81491](https://github.com/launchdarkly/python-ai-sdk/commit/8b81491b46dfbbfce132f98cdb49320281ff2d3c))
+
+
+### Features
+
+* add max_retries to the messages handler factories ([#214](https://github.com/launchdarkly/python-ai-sdk/issues/214)) ([c08aea8](https://github.com/launchdarkly/python-ai-sdk/commit/c08aea84a6ef4558e6b943f4a302496f7f24d898))
+* **evaluations:** `Judge` and `Scorer` default `pass_rate_threshold` to 0.95 again, so a run where some rows fail can now pass; set it to 1.0 to require every row to pass ([c128c98](https://github.com/launchdarkly/python-ai-sdk/commit/c128c98366ddca7a6621e9489e3c565c1e52e820))
+* **evaluations:** return tool errors to the model and mark eval spans for viewers ([#271](https://github.com/launchdarkly/python-ai-sdk/issues/271)) ([2ebda1d](https://github.com/launchdarkly/python-ai-sdk/commit/2ebda1d1ab949b4a2d9b2b0d1c366adffe4f738a))
+* **evaluations:** return verdicts for evaluations from code ([c128c98](https://github.com/launchdarkly/python-ai-sdk/commit/c128c98366ddca7a6621e9489e3c565c1e52e820))
+
+
+### Bug Fixes
+
+* **client:** add Bedrock inference-profile prefix helpers for handler model ids ([#281](https://github.com/launchdarkly/python-ai-sdk/issues/281)) ([2740beb](https://github.com/launchdarkly/python-ai-sdk/commit/2740beb71e92b62d581a97e6be708e9b39104f8b))
+* **client:** concurrent first init_client calls share one attempt ([#255](https://github.com/launchdarkly/python-ai-sdk/issues/255)) ([b97b385](https://github.com/launchdarkly/python-ai-sdk/commit/b97b3850ade7693a45b7687fae221c170355af99))
+* **tools:** hand each handler only the tools its config attaches ([#279](https://github.com/launchdarkly/python-ai-sdk/issues/279)) ([4c786ef](https://github.com/launchdarkly/python-ai-sdk/commit/4c786eff17bbf48720b2fcdc35c0ae13871cfcb1))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.5.0...launchdarkly-ai-server-1.0.0) (2026-10-30)
 
 

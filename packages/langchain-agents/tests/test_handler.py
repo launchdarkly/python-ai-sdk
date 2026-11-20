@@ -421,7 +421,7 @@ def _built_tool(config_tools: dict[str, Any], handlers: dict[str, Any]) -> Any:
 
 class TestToolExecutionLoop:
     @pytest.mark.asyncio
-    async def test_tool_not_found_throws(self) -> None:
+    async def test_a_config_tool_with_no_handler_is_not_offered(self) -> None:
         mocks = _make_langchain_mock()
         captured_fns: list[Any] = []
 
@@ -437,11 +437,11 @@ class TestToolExecutionLoop:
             )
             from launchdarkly_ai_langchain_agents.handler import _build_agent_tools
 
-            _build_agent_tools(config["tools"], {})  # no handler registered
+            built = _build_agent_tools(config["tools"], {})  # no handler registered
 
-        if captured_fns:
-            with pytest.raises(ValueError, match="No handler"):
-                await captured_fns[0](key="val")
+        # The model never learns of a tool nothing implements, so it cannot call it.
+        assert built == []
+        assert captured_fns == []
 
     @pytest.mark.asyncio
     async def test_native_tool_is_not_registered(self) -> None:
@@ -2705,6 +2705,29 @@ class TestModelSource:
         ):
             await create_langchain_agents_handler()(cfg, "q")
         assert ctor.call_args.kwargs["model"] == "us.anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_bedrock_region_skips_another_cross_region_prefix(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("bedrock")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "global.anthropic.claude-sonnet-4-5",
+                "region": "us",
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                "sys.modules",
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "global.anthropic.claude-sonnet-4-5"
 
     @pytest.mark.asyncio
     async def test_bedrock_without_region_keeps_the_model_name(self) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -113,6 +113,38 @@ async def run_judges(
     unchanged, and so is a judge for a config with no tools.
     """
     from .lifecycle import extract_variation
+
+    return await _run_judges(
+        config=config,
+        user_context=user_context,
+        handler=handler,
+        handlers=handlers,
+        user_input=user_input,
+        llm_response=llm_response,
+        base_track_data=base_track_data,
+        tool_handlers=tool_handlers,
+        graph_key=graph_key,
+        trajectory=trajectory,
+        resolve=extract_variation,
+    )
+
+
+async def _run_judges(
+    *,
+    config: AiConfigRep,
+    user_context: LDContext,
+    handler: ProviderHandler,
+    handlers: list[ProviderHandler] | None,
+    user_input: str | None,
+    llm_response: str,
+    base_track_data: TrackData,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
+    graph_key: str | None = None,
+    trajectory: str = "",
+    resolve: Callable[[str, LDContext], Awaitable[dict[str, Any]]],
+) -> dict[str, JudgeResult]:
+    """:func:`run_judges`, resolving each judge's variation with ``resolve``.
+    A judge whose resolution raises is logged and skipped."""
     from .tracking import execute_and_track
 
     judge_results: dict[str, JudgeResult] = {}
@@ -134,7 +166,7 @@ async def run_judges(
         judge_key = judge["key"]
 
         try:
-            variation = await extract_variation(judge_key, user_context)
+            variation = await resolve(judge_key, user_context)
             judge_ai_config: AiConfigRep = variation["config"]
             judge_meta = variation["meta"]
 

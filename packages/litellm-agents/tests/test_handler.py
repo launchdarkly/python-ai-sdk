@@ -164,6 +164,59 @@ class TestFactoryAndModelBinding:
         assert "api_key" not in litellm_model.call_args.kwargs
         assert FakeAgent.created[0]["model"] is litellm_model.return_value
 
+    @pytest.mark.parametrize(
+        ("provider", "model", "expected"),
+        [
+            (
+                "LiteLLM",
+                {"name": "bedrock/anthropic.claude-opus-5-5", "region": "us"},
+                "bedrock/us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5", "region": "global"},
+                "global.anthropic.claude-opus-5-5",
+            ),
+            (
+                "LiteLLM",
+                {"name": "bedrock/us.anthropic.claude-opus-5-5", "region": "us"},
+                "bedrock/us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "LiteLLM",
+                {"name": "bedrock/anthropic.claude-opus-5-5"},
+                "bedrock/anthropic.claude-opus-5-5",
+            ),
+            (
+                "Anthropic",
+                {"name": "anthropic/claude-sonnet-4", "region": "us"},
+                "anthropic/claude-sonnet-4",
+            ),
+        ],
+    )
+    async def test_bedrock_region_is_the_inference_profile_prefix(
+        self, provider: str, model: dict[str, Any], expected: str
+    ) -> None:
+        agents = _agents_module()
+        litellm_model = MagicMock(return_value=object())
+        span = MagicMock()
+        trace = MagicMock()
+        trace.get_tracer.return_value.start_span.return_value = span
+        config = {**CONFIG, "provider": {"name": provider}, "model": model}
+        with (
+            _patch_agents(agents),
+            patch.object(handler_mod, "LitellmModel", litellm_model),
+            patch.object(handler_mod, "trace", trace),
+        ):
+            await create_litellm_agents_handler()(config, "q")
+        assert litellm_model.call_args.kwargs["model"] == expected
+        models = {
+            call.args[1]
+            for call in span.set_attribute.call_args_list
+            if call.args[0] in ("gen_ai.request.model", "gen_ai.response.model")
+        }
+        assert models == {expected}
+
     async def test_config_cannot_redirect_the_provider_key(self) -> None:
         agents = _agents_module()
         litellm_model = MagicMock(return_value=object())
@@ -270,6 +323,21 @@ class TestAgentToolsAndRun:
         assert tools[0].params_json_schema == {"type": "object"}
         await tools[0].on_invoke_tool(SimpleNamespace(), '{"city":"Austin"}')
         weather.assert_awaited_once_with({"city": "Austin"})
+
+    async def test_a_registered_tool_the_config_does_not_attach_is_not_given(
+        self,
+    ) -> None:
+        agents = _agents_module()
+        config = {
+            **CONFIG,
+            "tools": {"safe": {"description": "d", "parameters": {}}},
+        }
+        handlers = {"safe": AsyncMock(), "privileged": AsyncMock()}
+        with _patch_agents(agents):
+            await create_litellm_agents_handler(model_factory=lambda *_: object())(
+                config, "q", handlers
+            )
+        assert [tool.name for tool in FakeAgent.created[0]["tools"]] == ["safe"]
 
     async def test_runner_receives_agent_prompt_and_max_turns(self) -> None:
         run = AsyncMock(

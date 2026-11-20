@@ -288,7 +288,11 @@ async def test_a_native_tool_is_not_recorded_online_either(
 
     result = await execute_and_track(
         config_key="c",
-        config={"model": {"name": "m"}, "provider": {"name": "TestProvider"}},
+        config={
+            "model": {"name": "m"},
+            "provider": {"name": "TestProvider"},
+            "tools": {"web_search": {"type": "function", "parameters": {}}},
+        },
         meta={"variationKey": "v", "version": 1},
         user_context=CONTEXT,
         handler=handler,  # type: ignore[arg-type]
@@ -454,15 +458,12 @@ async def test_a_registry_tool_the_config_omits_is_not_described(
 
 
 @pytest.mark.asyncio
-async def test_a_config_tool_with_no_implementation_is_still_available(
+async def test_only_tools_the_model_was_offered_are_available(
     mock_ld_client: Any,
 ) -> None:
-    """The config's own tool catalog determines what the model was offered,
-    independent of whether a local implementation was registered for it -- a
-    handler package can build the provider's tool list straight from the
-    config. Omitting an unimplemented tool from "Tools available" would let a
-    judge read an incomplete catalog instead of one the agent chose not to use.
-    """
+    """Handlers offer only config tools with an implementation, so a tool the
+    config declares but nothing implements was never the model's to call.
+    Listing it would show a judge a tool the agent never had."""
 
     async def handler(
         config: Any,
@@ -478,19 +479,23 @@ async def test_a_config_tool_with_no_implementation_is_still_available(
         config={
             "model": {"name": "m"},
             "provider": {"name": "TestProvider"},
-            "tools": {"lookup_order": {"description": "", "parameters": {}}},
+            "tools": {
+                "lookup_order": {"description": "", "parameters": {}},
+                "search": {"description": "", "parameters": {}},
+            },
         },
         meta={"variationKey": "v", "version": 1},
         user_context=CONTEXT,
         handler=handler,  # type: ignore[arg-type]
         user_input="q",
-        tool_handlers=None,
+        tool_handlers={"search": lambda _args: "found", "unattached": lambda _a: ""},
     )
 
     assert (
-        "Tools available: lookup_order\n"
-        "No tool calls were made while producing the response."
+        "Tools available: search\nNo tool calls were made while producing the response."
     ) in result["trajectory"]
+    assert "lookup_order" not in result["trajectory"]
+    assert "unattached" not in result["trajectory"]
 
 
 @pytest.mark.asyncio

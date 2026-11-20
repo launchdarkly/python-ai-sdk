@@ -163,6 +163,62 @@ class TestFactoryAndTransport:
         completion.assert_awaited_once()
         assert completion.call_args.kwargs["model"] == "anthropic/claude-sonnet-4"
 
+    @pytest.mark.parametrize(
+        ("provider", "model", "expected"),
+        [
+            (
+                "LiteLLM",
+                {"name": "bedrock/anthropic.claude-opus-5-5", "region": "us"},
+                "bedrock/us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5", "region": "global"},
+                "global.anthropic.claude-opus-5-5",
+            ),
+            (
+                "LiteLLM",
+                {"name": "bedrock/us.anthropic.claude-opus-5-5", "region": "us"},
+                "bedrock/us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "LiteLLM",
+                {"name": "bedrock/anthropic.claude-opus-5-5"},
+                "bedrock/anthropic.claude-opus-5-5",
+            ),
+            (
+                "Anthropic",
+                {"name": "anthropic/claude-sonnet-4", "region": "us"},
+                "anthropic/claude-sonnet-4",
+            ),
+        ],
+    )
+    async def test_bedrock_region_is_the_inference_profile_prefix(
+        self, provider: str, model: dict[str, Any], expected: str
+    ) -> None:
+        completion = AsyncMock(return_value=_response())
+        span = MagicMock()
+        trace = MagicMock()
+        tracer = trace.get_tracer.return_value
+        tracer.start_span.return_value = span
+        config = {**CONFIG, "provider": {"name": provider}, "model": model}
+        with patch.object(handler_mod, "trace", trace):
+            await create_litellm_messages_handler(completion=completion)(
+                config, "question"
+            )
+        assert completion.call_args.kwargs["model"] == expected
+        span_models = {
+            (call.args[0], call.args[1])
+            for call in span.set_attribute.call_args_list
+            if call.args[0] in ("gen_ai.request.model", "gen_ai.response.model")
+        }
+        assert span_models == {
+            ("gen_ai.request.model", expected),
+            ("gen_ai.response.model", expected),
+        }
+        span_names = [call.args[0] for call in tracer.start_span.call_args_list]
+        assert f"chat {expected}" in span_names
+
     async def test_never_constructs_a_provider_direct_client(self) -> None:
         completion = AsyncMock(return_value=_response())
         forbidden = MagicMock(side_effect=AssertionError("provider-direct path"))
@@ -922,3 +978,35 @@ class TestMaxRetries:
         assert factory.call_args.kwargs["max_retries"] == 6
         # config() takes no such argument, so leaving it in kwargs would raise TypeError.
         assert "max_retries" not in config.call_args.kwargs
+
+
+class TestUnofferedToolsFailClosed:
+    """A tool name in a model response is untrusted. The handler resolves it only
+    against the tools it offered, and raises naming the tool otherwise: a name
+    registered nowhere, a registered tool the config does not attach, and an
+    attribute name all fail, and no registered handler runs."""
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    @pytest.mark.parametrize("name", ["ghost", "privileged", "__class__"])
+    async def test_rejects_a_tool_it_did_not_offer(self, path: str, name: str) -> None:
+        privileged = AsyncMock(return_value="ran")
+        handlers = {"safe": AsyncMock(return_value="ok"), "privileged": privileged}
+        config = {**CONFIG, "tools": {"safe": {"description": "", "parameters": {}}}}
+        if path == "invoke":
+            completion = AsyncMock(
+                return_value=_response(None, tool_calls=[_tool_call(name, "c1", "{}")])
+            )
+        else:
+            delta = SimpleNamespace(
+                index=0, id="c1", function=SimpleNamespace(name=name, arguments="{}")
+            )
+            completion = AsyncMock(
+                return_value=FakeStream([_chunk(tool_calls=[delta])])
+            )
+        handler = create_litellm_messages_handler(completion=completion)
+        with pytest.raises(ValueError, match=f'tool "{name}"'):
+            if path == "invoke":
+                await handler(config, "q", handlers)
+            else:
+                await _events(await handler.stream(config, "q", handlers))
+        privileged.assert_not_awaited()

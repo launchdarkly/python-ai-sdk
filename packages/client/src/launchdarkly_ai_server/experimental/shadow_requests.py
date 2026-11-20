@@ -5,8 +5,9 @@ Use ``shadow_config()`` in place of ``config()`` to also run the shadow variatio
 LaunchDarkly attaches to the matched targeting rule or the fallthrough. The served
 variation runs exactly as ``config()`` runs it. Once it succeeds, each sampled shadow
 runs on the same input in the background, or is handed to ``on_task`` to run later with
-``run_shadow()``. A shadow's response is discarded; it is tracked on the normal
-``$ld:ai:*`` events with ``isShadow``. These names may change in a minor release, so
+``run_shadow()``. The shadow variation's judges score its response, which is then
+discarded; the shadow and its judge scores are tracked on the normal events with
+``isShadow``. These names may change in a minor release, so
 review the changelog when you upgrade.
 """
 
@@ -25,15 +26,27 @@ from typing import Any
 
 from opentelemetry import context as otel_context
 
-from ..client import ConfigInstance, _InternalConfigInstance
+from ..client import (
+    ConfigInstance,
+    _InternalConfigInstance,
+    _resolve_output_format_response,
+)
 from ..conversation import _CONV_KEY, _conversation_id_from
-from ..lifecycle import _fetch_variation, _parse_variation
+from ..judge_scoring import judge_text
+from ..judges import _run_judges as _run_core_judges
+from ..lifecycle import (
+    _existing_client,
+    _extract_existing_variation,
+    _fetch_variation,
+    _parse_variation,
+)
 from ..registry import resolve_handlers
 from ..sdk_usage import report_usage
 from ..shutdown_hooks import register_shutdown_hook
 from ..tracking import execute_and_track, make_track_data
 from ..types import (
     AiConfigRep,
+    JudgeResult,
     LDContext,
     NativeTool,
     ProviderHandler,
@@ -52,15 +65,16 @@ logger = logging.getLogger("launchdarkly_ai_server.experimental.shadow_requests"
 
 _FALLTHROUGH = "fallthrough"
 _PENDING_SHADOWS = "__ld_pending_shadows"
-_SHADOW_ONLY_KEYS = ("tools", "judgeConfiguration", "shadowConfiguration")
+_SHADOW_ONLY_KEYS = ("tools", "shadowConfiguration")
 _BUCKET_SCALE = float(0xFFFFFFFFFFFFFFF)
 
 
 @dataclass(frozen=True)
 class ShadowTask:
     """
-    Everything needed to run and track one sampled shadow, with no flag evaluation.
-    Plain data, so it survives ``pickle``. Run it with ``run_shadow(task, handlers)``.
+    Everything needed to run and track one sampled shadow. Running it evaluates no
+    flag except the shadow's judges. Plain data, so it survives ``pickle``. Run it
+    with ``run_shadow(task, handlers)``.
     """
 
     config_key: str
@@ -79,11 +93,16 @@ class ShadowTask:
 
 @dataclass(frozen=True)
 class ShadowResult:
-    """The outcome of one shadow run. There is no response text: it is discarded."""
+    """
+    The outcome of one shadow run. There is no response text: it is discarded.
+    ``judge_results`` holds the shadow variation's judge scores, present only when
+    at least one judge scored.
+    """
 
     usage: dict[str, int]
     track_data: dict[str, Any]
     error: str | None = None
+    judge_results: dict[str, JudgeResult] | None = None
 
 
 _running: set[asyncio.Task[ShadowResult]] = set()
@@ -430,11 +449,48 @@ async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResul
                 span_attributes=task.span_attributes,
                 feature_flag_event=False,
             )
+            judge_results = await _run_judges(task, handler, handlers, result)
     except _ShadowTimeout:
         return _failed(task, "timeout")
     except Exception as err:
         return _failed(task, str(err) or type(err).__name__)
-    return ShadowResult(usage=result["usage"], track_data=result["track_data"])
+    return ShadowResult(
+        usage=result["usage"],
+        track_data=result["track_data"],
+        judge_results=judge_results or None,
+    )
+
+
+async def _run_judges(
+    task: ShadowTask,
+    handler: ProviderHandler,
+    handlers: list[ProviderHandler],
+    result: dict[str, Any],
+) -> dict[str, JudgeResult]:
+    """Scores the shadow's response with its own judges, outside the shadow timeout.
+
+    Judges resolve through the client already set up and never start one, so
+    with no live client they are skipped."""
+    if _existing_client() is None:
+        return {}
+    try:
+        response = _resolve_output_format_response(
+            result["response"], task.shadow_config.get("outputFormat")
+        )
+        return await _run_core_judges(
+            config=task.shadow_config,
+            user_context=task.user_context,
+            handler=handler,
+            handlers=handlers,
+            user_input=task.user_input,
+            trajectory=result.get("trajectory", ""),
+            llm_response=judge_text(response),
+            base_track_data=result["track_data"],
+            resolve=_extract_existing_variation,
+        )
+    except Exception:
+        logger.warning("Shadow request judges failed", exc_info=True)
+        return {}
 
 
 @contextmanager

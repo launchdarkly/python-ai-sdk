@@ -45,6 +45,7 @@ from launchdarkly_ai_claude_agents.handler import (
     _build_prompt,
     _build_tool_mcp,
     _host_query_options,
+    _model_id,
     _options_parameters,
     _partition_tools,
     _raise_if_run_failed,
@@ -167,9 +168,11 @@ async def _run_query(
     hooks = _build_hooks(native_tool_map)
 
     params = _options_parameters(node.config)
+    model_id = _model_id(node.config)
 
     options = ClaudeAgentOptions(
         **params,
+        **({"model": model_id} if model_id is not None else {}),
         # Explicitly set the available built-in tools (empty list disables all).
         # When no native tools are needed, disable built-in tools so Claude
         # cannot call WebSearch/Bash/etc. and get stuck waiting for permission

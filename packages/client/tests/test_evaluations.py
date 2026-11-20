@@ -10,6 +10,7 @@ import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server import (
+    CriterionSummary,
     EvalRunResult,
     EvaluationsError,
     RunSummary,
@@ -327,6 +328,30 @@ def test_requests_carry_token_auth_and_json_body() -> None:
     assert request["body"] == {"key": "support-qa"}
 
 
+def test_patch_sends_json_body() -> None:
+    transport = RecordingTransport(
+        [HttpResponse(status=200, body='{"id": "eval-1", "version": 2}')]
+    )
+    client = LDApiClient(api_key="api-token", transport=transport)
+
+    result = client.patch(
+        "projects/proj/offline-evaluations/support-qa",
+        body={"name": "support-qa", "generationProvider": "OpenAI"},
+    )
+
+    assert result == {"id": "eval-1", "version": 2}
+    request = transport.requests[0]
+    assert request["method"] == "PATCH"
+    assert request["url"] == (
+        f"{DEFAULT_BASE_URI}/api/v2/projects/proj/offline-evaluations/support-qa"
+    )
+    assert request["headers"]["Content-Type"] == "application/json"
+    assert request["body"] == {
+        "name": "support-qa",
+        "generationProvider": "OpenAI",
+    }
+
+
 def test_get_encodes_query_params_and_omits_none() -> None:
     transport = RecordingTransport([HttpResponse(status=200, body='{"items": []}')])
     client = LDApiClient(
@@ -470,6 +495,82 @@ def test_idempotent_post_is_retried_after_a_server_error() -> None:
     assert len(transport.requests) == 2
 
 
+def test_idempotent_patch_is_retried_after_a_server_error() -> None:
+    transport = RecordingTransport(
+        [
+            HttpResponse(status=503, body='{"message": "unavailable"}'),
+            HttpResponse(status=200, body='{"id": "eval-1", "version": 2}'),
+        ]
+    )
+    client = LDApiClient(
+        api_key="api-token",
+        transport=transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.patch(
+        "projects/proj/offline-evaluations/support-qa",
+        body={"generationProvider": "OpenAI"},
+        idempotent=True,
+    ) == {"id": "eval-1", "version": 2}
+    assert len(transport.requests) == 2
+
+
+def test_unmarked_patch_is_not_retried_after_a_server_error() -> None:
+    transport = RecordingTransport(
+        [
+            HttpResponse(status=503, body='{"message": "unavailable"}'),
+            HttpResponse(status=200, body='{"id": "eval-1", "version": 2}'),
+        ]
+    )
+    client = LDApiClient(
+        api_key="api-token",
+        transport=transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    with pytest.raises(LDApiError) as excinfo:
+        client.patch("projects/proj/offline-evaluations/support-qa", body={})
+
+    assert excinfo.value.status == 503
+    assert len(transport.requests) == 1
+
+
+def test_idempotent_patch_is_replayed_after_a_transport_failure() -> None:
+    attempts: list[str] = []
+
+    def flaky_transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
+        attempts.append(method)
+        if len(attempts) == 1:
+            raise TimeoutError("timed out")
+        return HttpResponse(status=200, body='{"id": "eval-1", "version": 2}')
+
+    client = LDApiClient(
+        api_key="api-token",
+        transport=flaky_transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.patch(
+        "projects/proj/offline-evaluations/support-qa",
+        body={"generationProvider": "OpenAI"},
+        idempotent=True,
+    ) == {"id": "eval-1", "version": 2}
+    assert attempts == ["PATCH", "PATCH"]
+
+
 def test_idempotent_post_is_replayed_after_a_transport_failure() -> None:
     attempts: list[str] = []
 
@@ -565,6 +666,94 @@ def test_run_summary_and_result() -> None:
     assert RunSummary.from_wire(None) == RunSummary()
     assert result.passed is False
     assert result.run_id == "run-1"
+    assert result.verdict is None
+    assert summary.criteria == []
+
+
+def test_run_summary_parses_criterion_summaries() -> None:
+    summary = RunSummary.from_wire(
+        {
+            "total": 10,
+            "passed": 9,
+            "failed": 1,
+            "error": 0,
+            "criterionSummaries": [
+                {
+                    "criterionType": "exact",
+                    "criterionPassRateThreshold": 0.8,
+                    "passed": 9,
+                    "failed": 1,
+                    "error": 0,
+                    "passRate": 0.9,
+                    "passRateVerdict": "pass",
+                },
+                {
+                    "criterionType": "tone",
+                    "criterionPassRateThreshold": None,
+                    "passed": 10,
+                    "failed": 0,
+                    "error": 0,
+                },
+                "not a mapping",
+            ],
+        }
+    )
+
+    assert summary.criteria == [
+        CriterionSummary(
+            criterion_type="exact",
+            pass_rate_threshold=0.8,
+            passed_rows=9,
+            failed_rows=1,
+            error_rows=0,
+            pass_rate=0.9,
+            pass_rate_verdict="pass",
+        ),
+        CriterionSummary(criterion_type="tone", passed_rows=10),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param("nine", 0, id="non-numeric-string"),
+        pytest.param("", 0, id="empty-string"),
+        pytest.param(None, 0, id="null"),
+        pytest.param(float("nan"), 0, id="nan"),
+        pytest.param(float("inf"), 0, id="infinity"),
+        pytest.param("Infinity", 0, id="infinity-string"),
+        pytest.param({"n": 9}, 0, id="mapping"),
+        pytest.param("9", 9, id="numeric-string"),
+        pytest.param(" 9.7 ", 9, id="padded-float-string"),
+        pytest.param(9.7, 9, id="float"),
+        pytest.param(True, 1, id="true"),
+    ],
+)
+def test_a_criterion_count_is_read_as_the_js_sdk_reads_it(
+    value: object, expected: int
+) -> None:
+    """Every row is already accounted for when the criterion counts are read,
+    so a count that does not read as a finite number is 0 rather than an
+    error. Numeric strings and booleans are coerced, as ``Number()`` does."""
+    [criterion] = RunSummary.from_wire(
+        {
+            "criterionSummaries": [
+                {"criterionType": "x", "passed": value, "failed": value, "error": 2}
+            ]
+        }
+    ).criteria
+
+    assert (criterion.passed_rows, criterion.failed_rows) == (expected, expected)
+    assert criterion.error_rows == 2
+
+
+def test_an_unknown_verdict_is_treated_as_none() -> None:
+    """A verdict LaunchDarkly adds later is not guessed at as a pass or fail."""
+    [criterion] = RunSummary.from_wire(
+        {"criterionSummaries": [{"criterionType": "x", "passRateVerdict": "maybe"}]}
+    ).criteria
+
+    assert criterion.pass_rate_verdict is None
 
 
 def test_project_key_resolves_from_the_environment(monkeypatch) -> None:

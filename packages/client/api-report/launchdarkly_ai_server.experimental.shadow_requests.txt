@@ -2,8 +2,9 @@
 run_shadow(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResult  [async]
 shadow_config(*, key: str, handler: ProviderHandler | list[ProviderHandler] | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, registry: Any = None, skip_judges: bool = False, shadow_timeout_s: float = 30.0, on_task: Callable[[ShadowTask], None] | None = None) -> ConfigInstance
 ShadowResult  [class, @dataclass(frozen=True)]
-  __init__(usage: dict[str, int], track_data: dict[str, Any], error: str | None = None)
+  __init__(usage: dict[str, int], track_data: dict[str, Any], error: str | None = None, judge_results: dict[str, JudgeResult] | None = None)
   error: str | None = None
+  judge_results: dict[str, JudgeResult] | None = None
   track_data: dict[str, Any]
   usage: dict[str, int]
 ShadowTask  [class, @dataclass(frozen=True)]

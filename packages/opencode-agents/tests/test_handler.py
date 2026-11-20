@@ -301,6 +301,68 @@ class TestSurface:
             }
         ) == ("amazon-bedrock", "claude")
 
+    @pytest.mark.parametrize(
+        ("provider", "model", "expected"),
+        [
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5", "region": "us"},
+                ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5", "region": "global"},
+                ("amazon-bedrock", "global.anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Bedrock",
+                {"name": "us.anthropic.claude-opus-5-5", "region": "us"},
+                ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5"},
+                ("amazon-bedrock", "anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Anthropic",
+                {"name": "amazon-bedrock/anthropic.claude-opus-5-5", "region": "eu"},
+                ("amazon-bedrock", "eu.anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Anthropic",
+                {"name": "bedrock/anthropic.claude-opus-5-5", "region": "us"},
+                ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Bedrock",
+                {"name": "Bedrock/anthropic.claude-opus-5-5", "region": "global"},
+                ("amazon-bedrock", "global.anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Bedrock",
+                {"name": "bedrock/anthropic.claude-opus-5-5"},
+                ("amazon-bedrock", "anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Anthropic",
+                {"name": "claude-opus-5-5", "region": "us"},
+                ("anthropic", "claude-opus-5-5"),
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic/claude-opus-5-5", "region": "us"},
+                ("anthropic", "claude-opus-5-5"),
+            ),
+        ],
+    )
+    def test_bedrock_region_is_the_inference_profile_prefix(
+        self, provider: str, model: dict[str, Any], expected: tuple[str, str]
+    ) -> None:
+        assert (
+            default_model({"provider": {"name": provider}, "model": model}) == expected
+        )
+
     def test_provides_for_is_any_provider_in_agent_mode(self) -> None:
         handler, _script = playing([])
         assert handler.provides_for == ("*", "agent")
@@ -1645,11 +1707,13 @@ class TestProcess:
                 text_delta("m1", "p1", "Hi"),
                 assistant_completed("m1"),
             ],
-            delay_ready=0.6,
+            delay_ready=2.0,
         )
         handler = create_opencode_handler(**script.handler_args())
         async with handler:
-            async with asyncio.timeout(0.2):
+            # The boot is twice the timeout, so the test fails if boot moves inside it. The
+            # 1 s timeout leaves the stream itself room on a slow runner.
+            async with asyncio.timeout(1.0):
                 seen = [
                     event
                     async for event in await handler.stream(

@@ -35,7 +35,7 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import model_parameters
+from launchdarkly_ai_server.utils import litellm_model_name, model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 
@@ -135,7 +135,7 @@ def _value(value: Any, name: str, default: Any = None) -> Any:
 
 
 def _model_name(config_value: AiConfigRep) -> str:
-    return str((config_value.get("model") or {}).get("name") or "")
+    return litellm_model_name(config_value)
 
 
 #: LiteLLM routes that build an OpenAI SDK client, the only code in LiteLLM that reads
@@ -519,6 +519,10 @@ def _create_litellm_messages_handler(
         values = variables or {}
         messages = _build_messages(config_value, user_input, values, history)
         tools = _build_tools(config_value, handlers)
+        # A tool name in a model response is untrusted: dispatch only to what was offered.
+        offered = {
+            t["function"]["name"]: handlers[t["function"]["name"]] for t in tools
+        }
         root = _root_span(config_value, values, capture_content=capture_content)
         parent = _parent_context(root)
         total = SpanUsage()
@@ -602,7 +606,7 @@ def _create_litellm_messages_handler(
                 messages.extend(
                     await _execute_tools(
                         calls,
-                        handlers,
+                        offered,
                         parent,
                         ended,
                         capture_content=capture_content,
@@ -663,6 +667,8 @@ async def _stream(
 ) -> AsyncGenerator[dict[str, Any], None]:
     messages = _build_messages(config_value, user_input, variables, history)
     tools = _build_tools(config_value, handlers)
+    # A tool name in a model response is untrusted: dispatch only to what was offered.
+    offered = {t["function"]["name"]: handlers[t["function"]["name"]] for t in tools}
     root = _root_span(config_value, variables, capture_content=capture_content)
     parent = _parent_context(root)
     total = SpanUsage()
@@ -781,7 +787,7 @@ async def _stream(
             messages.extend(
                 await _execute_tools(
                     calls,
-                    handlers,
+                    offered,
                     parent,
                     ended,
                     capture_content=capture_content,
