@@ -87,6 +87,7 @@ NEVER_FORWARDED_KEYS = frozenset(
         "metadata",
         "user",
         "safety_identifier",
+        "user_profile_id",
         "request_metadata",
         # Runtime wiring and API-shape switches.
         "include",
