@@ -3324,7 +3324,10 @@ async def test_a_skill_tool_call_dispatches_and_is_tracked_like_any_tool(
                 tool_handlers={"get-weather": weather},
             ).invoke("weather?", {"kind": "user", "key": "u1"})
     finally:
-        set_skill_store(None)
+        # set_skill_store(None) is a no-op by design; clear the store itself.
+        from launchdarkly_ai_server.skills_core import clear_state
+
+        clear_state()
         lifecycle_module._reset_for_testing()
 
     assert result.response == "sunny"

@@ -1399,7 +1399,10 @@ def weather_skill_store() -> Iterator[None]:
     try:
         yield
     finally:
-        set_skill_store(None)
+        # set_skill_store(None) is a no-op by design; clear the store itself.
+        from launchdarkly_ai_server.skills_core import clear_state
+
+        clear_state()
 
 
 @pytest.mark.asyncio
