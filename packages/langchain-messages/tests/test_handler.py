@@ -952,7 +952,7 @@ class TestContentCapture:
                 cfg, "q", {"myTool": lambda _: "72F"}, {}
             )
         tool = rec.named("execute_tool ")[0]
-        assert tool.attributes["gen_ai.tool.call.arguments"] == '{"city": "NYC"}'
+        assert tool.attributes["gen_ai.tool.call.arguments"] == '{"city":"NYC"}'
         assert tool.attributes["gen_ai.tool.call.result"] == "72F"
 
     async def test_still_writes_the_legacy_content_events_when_enabled(self) -> None:

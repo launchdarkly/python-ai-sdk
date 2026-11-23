@@ -549,18 +549,22 @@ def tool_result_string(value: Any) -> str:
     """Render a tool handler's return value as the text sent back to the provider.
 
     A string passes through unchanged, ``None`` becomes ``""``, and anything else becomes
-    JSON (non-ASCII kept as is). A value JSON cannot encode falls back to ``str(value)``.
+    compact JSON (non-ASCII kept as is). A value JSON cannot encode falls back to ``str(value)``.
     """
-    if isinstance(value, str):
-        return value
     if value is None:
         return ""
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(value)
+    return _stringify_tool_value(value)
 
 
 def _stringify_tool_value(value: Any) -> str:
-    """A string passes through unchanged; anything else becomes JSON."""
-    return value if isinstance(value, str) else json.dumps(value)
+    """A string unchanged; anything else compact raw-UTF-8 JSON, or ``str()`` if JSON can't encode it.
+
+    The one encoding for tool arguments and results, on spans and in provider text, so every
+    language writes the same bytes: ``,`` and ``:`` with no spaces, as ``JSON.stringify`` does.
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)

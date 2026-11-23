@@ -2056,6 +2056,10 @@ class TestCallbackSpansNeverLeak:
     class _Unserialisable:
         __slots__ = ()
 
+        def __repr__(self) -> str:
+            # JSON falls back to str(), which uses repr(); it has to raise too.
+            raise TypeError("not renderable")
+
     def _recording_handler(self) -> Any:
         """The patch must stay active while the callbacks run, not only while they are built."""
         import launchdarkly_ai_langchain_agents.spans as spans_mod

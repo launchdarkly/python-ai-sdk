@@ -1303,7 +1303,7 @@ class TestContentCapture:
                 CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "72F"}, {}
             )
         tool = rec.named("execute_tool ")[0]
-        assert tool.attributes["gen_ai.tool.call.arguments"] == '{"city": "NYC"}'
+        assert tool.attributes["gen_ai.tool.call.arguments"] == '{"city":"NYC"}'
         assert tool.attributes["gen_ai.tool.call.result"] == "72F"
 
     async def test_still_writes_the_legacy_content_events_when_enabled(
@@ -2388,6 +2388,10 @@ class TestToolSpanNeverLeaks:
 
         class _Unserialisable:
             __slots__ = ()
+
+            def __repr__(self) -> str:
+                # JSON falls back to str(), which uses repr(); it has to raise too.
+                raise TypeError("not renderable")
 
         ctx, rec = _recording()
         from launchdarkly_ai_claude_messages import create_claude_messages_handler

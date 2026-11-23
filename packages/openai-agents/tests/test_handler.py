@@ -598,7 +598,7 @@ class TestToolConversion:
             {"my-tool": {"description": "d"}}, {"my-tool": _sync}
         )
         out = await tools[0].on_invoke_tool(MagicMock(), '{"order_id": "A19"}')
-        assert out == json.dumps({"order_id": "A19", "status": "shipped"})
+        assert out == '{"order_id":"A19","status":"shipped"}'
 
     async def test_async_tool_handler_result_is_returned(self) -> None:
         async def _async(args: Any) -> str:
@@ -1154,7 +1154,7 @@ class TestContentCapture:
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         tool_span = rec.named("execute_tool ")[0]
-        assert tool_span.attributes["gen_ai.tool.call.arguments"] == '{"q": "x"}'
+        assert tool_span.attributes["gen_ai.tool.call.arguments"] == '{"q":"x"}'
         assert tool_span.attributes["gen_ai.tool.call.result"] == "found"
 
     async def test_closes_the_tool_span_when_the_sdk_reports_no_call_id(self) -> None:
@@ -2541,7 +2541,9 @@ class TestToolSpanSurvivesAContentFailure:
         # so the span was untracked and unended: never exported, and a reader saw a tool that started
         # and never returned.
         class Unserialisable:
-            pass
+            def __repr__(self) -> str:
+                # JSON falls back to str(), which uses repr(); it has to raise too.
+                raise TypeError("not renderable")
 
         turns = [
             {
