@@ -6,7 +6,6 @@ These imports are intentionally unresolved at the test-first checkpoint.
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -401,7 +400,7 @@ class TestToolsAndUsage:
         assert follow_up[-1] == {
             "role": "tool",
             "tool_call_id": "call-1",
-            "content": json.dumps({"forecast": "sunny"}),
+            "content": '{"forecast":"sunny"}',
         }
         assert result["output"] == "sunny"
 

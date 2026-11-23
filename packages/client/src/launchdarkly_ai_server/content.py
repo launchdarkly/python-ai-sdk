@@ -559,12 +559,15 @@ def tool_result_string(value: Any) -> str:
 def _stringify_tool_value(value: Any) -> str:
     """A string unchanged; anything else compact raw-UTF-8 JSON, or ``str()`` if JSON can't encode it.
 
-    The one encoding for tool arguments and results, on spans and in provider text, so every
-    language writes the same bytes: ``,`` and ``:`` with no spaces, as ``JSON.stringify`` does.
+    The one encoding for tool arguments and results, on spans and in provider text: ``,`` and
+    ``:`` with no spaces, as ``JSON.stringify`` does. NaN and Infinity are not JSON, so they take
+    the ``str()`` fallback (``nan``, ``inf``); that plain-string form differs by language.
     """
     if isinstance(value, str):
         return value
     try:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
     except (TypeError, ValueError):
         return str(value)
