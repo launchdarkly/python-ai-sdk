@@ -929,6 +929,106 @@ async def test_failed_tool_span(
         assert error not in str(dict(tool.attributes))
 
 
+async def test_failed_tool_span_without_error_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An error state with no ``error`` field writes no result at all.
+
+    ``None`` must not become ``""`` or ``"null"``: a missing detail is not a
+    captured one, and the result attribute stays absent even with capture on.
+    """
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from opentelemetry.trace import StatusCode
+
+    from launchdarkly_ai_opencode_agents import spans as span_module
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(span_module.trace, "get_tracer", provider.get_tracer)
+    handler, _script = playing(
+        [
+            assistant_open("m1"),
+            tool_part("c1", "running", raw_input={"query": "example"}),
+            tool_part("c1", "error"),
+            assistant_completed("m1"),
+        ],
+        capture_content=True,
+    )
+    try:
+        await handler({"instructions": "Be brief.", "model": {"name": "m"}}, "hi")
+        spans = exporter.get_finished_spans()
+    finally:
+        provider.shutdown()
+
+    (tool,) = [span for span in spans if span.name == "execute_tool bash"]
+    assert tool.end_time is not None
+    assert tool.status.status_code == StatusCode.ERROR
+    assert tool.attributes["error.type"] == "tool_error"
+    assert "gen_ai.tool.call.result" not in tool.attributes
+    assert tool.attributes.get("gen_ai.tool.call.result") is None
+    assert json.loads(tool.attributes["gen_ai.tool.call.arguments"]) == {
+        "query": "example"
+    }
+
+
+@pytest.mark.parametrize("capture_content", [False, True])
+async def test_completed_tool_span(
+    monkeypatch: pytest.MonkeyPatch, capture_content: bool
+) -> None:
+    """A completed tool spans OK, with its result behind the capture gate."""
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from opentelemetry.trace import StatusCode
+
+    from launchdarkly_ai_opencode_agents import spans as span_module
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(span_module.trace, "get_tracer", provider.get_tracer)
+    output = "file.txt"
+    handler, _script = playing(
+        [
+            assistant_open("m1"),
+            tool_part("c1", "running", raw_input={"command": "ls"}),
+            tool_part("c1", "completed", raw_input={"command": "ls"}, output=output),
+            assistant_completed("m1"),
+        ],
+        capture_content=capture_content,
+    )
+    try:
+        await handler({"instructions": "Be brief.", "model": {"name": "m"}}, "hi")
+        spans = exporter.get_finished_spans()
+    finally:
+        provider.shutdown()
+
+    (tool,) = [span for span in spans if span.name == "execute_tool bash"]
+    (root,) = [span for span in spans if span.name == "invoke_agent"]
+    assert tool.parent == root.context
+    assert tool.end_time is not None
+    assert tool.status.status_code == StatusCode.OK
+    assert "error.type" not in tool.attributes
+    assert tool.attributes["gen_ai.operation.name"] == "execute_tool"
+    assert tool.attributes["gen_ai.tool.name"] == "bash"
+    assert tool.attributes["gen_ai.tool.call.id"] == "c1"
+    if capture_content:
+        assert tool.attributes["gen_ai.tool.call.result"] == output
+        assert json.loads(tool.attributes["gen_ai.tool.call.arguments"]) == {
+            "command": "ls"
+        }
+    else:
+        assert "gen_ai.tool.call.result" not in tool.attributes
+        assert "gen_ai.tool.call.arguments" not in tool.attributes
+
+
 class TestStableStream:
     async def test_a_tool_does_not_close_the_stream(
         self, mock_ld_client: MagicMock
