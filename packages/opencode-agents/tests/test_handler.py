@@ -80,6 +80,7 @@ def tool_part(
     name: str = "bash",
     raw_input: Any = None,
     output: Any = None,
+    error: str | None = None,
     part_id: str | None = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {"status": status}
@@ -87,6 +88,8 @@ def tool_part(
         state["input"] = raw_input
     if output is not None:
         state["output"] = output
+    if error is not None:
+        state["error"] = error
     return bus(
         "message.part.updated",
         part={
@@ -869,6 +872,61 @@ class TestText:
         assert "ProviderAuthError" in str(raised.value)
         assert "secret-body" not in str(raised.value)
         assert "done" not in seen
+
+
+@pytest.mark.parametrize("capture_content", [False, True])
+async def test_failed_tool_span(
+    monkeypatch: pytest.MonkeyPatch, capture_content: bool
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from opentelemetry.trace import StatusCode
+
+    from launchdarkly_ai_opencode_agents import spans as span_module
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(span_module.trace, "get_tracer", provider.get_tracer)
+    error = "synthetic tool failure detail"
+    handler, _script = playing(
+        [
+            assistant_open("m1"),
+            tool_part("c1", "running", raw_input={"query": "example"}),
+            tool_part("c1", "error", error=error),
+            assistant_completed("m1"),
+        ],
+        capture_content=capture_content,
+    )
+    try:
+        await handler({"instructions": "Be brief.", "model": {"name": "m"}}, "hi")
+        spans = exporter.get_finished_spans()
+    finally:
+        provider.shutdown()
+
+    (tool,) = [span for span in spans if span.name == "execute_tool bash"]
+    (root,) = [span for span in spans if span.name == "invoke_agent"]
+    assert tool.parent == root.context
+    assert tool.end_time is not None
+    assert tool.status.status_code == StatusCode.ERROR
+    assert error not in str(tool.status.description)
+    assert error not in str([event.attributes for event in tool.events])
+    assert tool.attributes["gen_ai.operation.name"] == "execute_tool"
+    assert tool.attributes["gen_ai.tool.name"] == "bash"
+    assert tool.attributes["gen_ai.tool.call.id"] == "c1"
+    assert tool.attributes["error.type"] == "tool_error"
+    if capture_content:
+        assert tool.attributes["gen_ai.tool.call.result"] == error
+        assert json.loads(tool.attributes["gen_ai.tool.call.arguments"]) == {
+            "query": "example"
+        }
+    else:
+        assert "gen_ai.tool.call.result" not in tool.attributes
+        assert "gen_ai.tool.call.arguments" not in tool.attributes
+        assert error not in str(dict(tool.attributes))
 
 
 class TestStableStream:
