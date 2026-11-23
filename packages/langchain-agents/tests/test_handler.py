@@ -955,6 +955,8 @@ class TestRootSpanAttributes:
             ("OpenAI", "openai"),
             ("Bedrock", "aws.bedrock"),
             ("bedrock", "aws.bedrock"),
+            ("Gemini", "gemini"),
+            ("gemini", "gemini"),
             ("Azure", "azure"),
             ("Cohere", "cohere"),
             ("Typo", "typo"),
@@ -2765,6 +2767,78 @@ class TestModelSource:
                 match=r"pip install \"launchdarkly-ai-langchain-agents\[aws\]\"",
             ):
                 handler_mod._make_default_chat_model(cfg)
+
+    @pytest.mark.asyncio
+    async def test_gemini_routes_to_chat_google_generative_ai(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("gemini")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {
+                "name": "gemini-3.1-pro-preview",
+                "region": "us",
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens": 256,
+                    "thinking_level": "low",
+                    "google_api_key": "leaked",
+                    "safety_settings": {"HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE"},
+                },
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                "sys.modules",
+                {"langchain_google_genai": MagicMock(ChatGoogleGenerativeAI=ctor)},
+            ),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        # Each alias arrives under its field name, and model.region is Bedrock-only.
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "max_output_tokens": 256,
+            "reasoning_effort": "low",
+            "model": "gemini-3.1-pro-preview",
+        }
+
+    def test_gemini_without_langchain_google_genai_has_a_clear_error(self) -> None:
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {"name": "gemini-3.1-pro-preview"},
+        }
+        with patch(
+            "importlib.import_module",
+            side_effect=ModuleNotFoundError("No module named 'langchain_google_genai'"),
+        ):
+            with pytest.raises(
+                ImportError,
+                match=r"pip install \"launchdarkly-ai-langchain-agents\[google\]\"",
+            ):
+                handler_mod._make_default_chat_model(cfg)
+
+    def test_gemini_builds_the_real_class(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {
+                "name": "gemini-3.1-pro-preview",
+                "parameters": {"stop": ["A"], "stop_sequences": ["B"], "top_k": 5},
+            },
+        }
+        model = handler_mod._make_default_chat_model(cfg)
+        assert isinstance(model, lc_google.ChatGoogleGenerativeAI)
+        assert model.model == "gemini-3.1-pro-preview"
+        # stop_sequences is the alias of stop, and the field wins when both are set.
+        assert model.stop == ["A"]
+        assert model.top_k == 5
 
     @pytest.mark.asyncio
     async def test_non_bedrock_ignores_model_region(self) -> None:

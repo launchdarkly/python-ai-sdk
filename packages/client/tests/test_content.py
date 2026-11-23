@@ -59,6 +59,20 @@ class TestToSemconvFinishReason:
         assert to_semconv_finish_reason("content_filter") == "content_filter"
         assert to_semconv_finish_reason("function_call") == "tool_calls"
 
+    def test_maps_every_gemini_spelling(self) -> None:
+        # ChatGoogleGenerativeAI reports the genai FinishReason enum name, upper-cased.
+        assert to_semconv_finish_reason("STOP") == "stop"
+        assert to_semconv_finish_reason("MAX_TOKENS") == "length"
+        for blocked in (
+            "SAFETY",
+            "RECITATION",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "IMAGE_SAFETY",
+        ):
+            assert to_semconv_finish_reason(blocked) == "content_filter", blocked
+
     def test_compares_lower_cased(self) -> None:
         assert to_semconv_finish_reason("END_TURN") == "stop"
         assert to_semconv_finish_reason("Max_Tokens") == "length"

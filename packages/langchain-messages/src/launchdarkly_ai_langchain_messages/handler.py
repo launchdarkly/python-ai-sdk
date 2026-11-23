@@ -58,10 +58,11 @@ from .spans import (
 #: Handler-owned, per model class. The handler always sets the model itself, and each
 #: class exposes that one constructor field under two names (the field and its alias), so a
 #: config value for either must never be forwarded: it would collide with the model the
-#: handler resolves, or override it.
+#: handler resolves, or override it. ``ChatGoogleGenerativeAI`` has no alias for it.
 _CHAT_OPENAI_OWNED_KEYS = frozenset({"model", "model_name"})
 _CHAT_ANTHROPIC_OWNED_KEYS = frozenset({"model", "model_name"})
 _CHAT_BEDROCK_CONVERSE_OWNED_KEYS = frozenset({"model", "model_id"})
+_CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS = frozenset({"model"})
 
 #: LangChain's own runtime fields, shared by every chat model class: caching, callbacks, rate
 #: limiting, tracing tags and metadata, streaming mode, message format, and token counting. They
@@ -392,6 +393,110 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "output_config",
 }
 
+#: Every key ``ChatGoogleGenerativeAI`` accepts (field names plus pydantic aliases), classified the
+#: same way as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``langchain-google-genai`` is not a dependency
+#: of this package (Gemini support is opt-in, see ``_make_default_chat_model``), so
+#: ``TestChatGoogleGenerativeAIAcceptsExactlyTheseKeys`` in this package's tests skips itself when
+#: it is not installed rather than asserting nothing.
+#:
+#: The cross-SDK list has no ChatGoogleGenerativeAI entry yet, so this list is the proposed one,
+#: and ``LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI`` in the shared test spec holds the same keys. Three
+#: of its fields take a second spelling, and each alias is renamed to the field before this list applies, with the field
+#: winning when the config also set it (see :data:`_CHAT_GOOGLE_GENERATIVE_AI_RENAMES`):
+#: ``max_tokens`` becomes ``max_output_tokens``, ``stop_sequences`` becomes ``stop``, and
+#: ``thinking_level`` (Gemini's own name) becomes ``reasoning_effort``.
+_CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS = frozenset(
+    {
+        "frequency_penalty",
+        "max_output_tokens",
+        "max_tokens",
+        "media_resolution",
+        "presence_penalty",
+        "reasoning_effort",
+        "seed",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "thinking_budget",
+        "thinking_level",
+        "top_k",
+        "top_p",
+    }
+)
+
+#: Alias to the name it is renamed to before forwarding. ``ChatGoogleGenerativeAI`` takes both
+#: spellings of each field, so passing both would leave which one wins to pydantic.
+_CHAT_GOOGLE_GENERATIVE_AI_RENAMES = {
+    "max_tokens": "max_output_tokens",
+    "stop_sequences": "stop",
+    "thinking_level": "reasoning_effort",
+}
+
+#: Accepted by ``ChatGoogleGenerativeAI`` but never forwarded, and why:
+#: * ``google_api_key``, ``api_key``, ``credentials``: credentials (field plus alias, and the
+#:   Google auth credentials object).
+#: * ``base_url``, ``client_options``, ``api_version``: where requests go.
+#: * ``vertexai``, ``project``, ``location``: which backend and Google Cloud project serve the
+#:   request, and the region, which decides where data is processed.
+#: * ``client``, ``client_args``: raw genai client objects and HTTP client settings.
+#: * ``additional_headers``, ``default_metadata``, ``default_metadata_input``, ``model_kwargs``:
+#:   raw request injection. ``model_kwargs`` is merged into the request, so it would carry any
+#:   excluded key past this list.
+#: * ``max_retries``, ``retries``, ``timeout``, ``request_timeout``: retries and timeouts.
+#: * ``response_mime_type``, ``response_schema``: API-shape switch. They are Gemini's
+#:   structured-output settings, and the handler owns structured output through the config's
+#:   ``outputFormat`` (``with_structured_output``). Set on the constructor, they would apply to
+#:   every request and constrain the reply a second time.
+#: * ``response_modalities``, ``image_config``: API-shape switch. They ask for image or audio
+#:   output, which the handler does not read.
+#: * ``n``, ``candidate_count``: response shape. The handler reads one reply, so extra candidates
+#:   are billed output the handler never returns.
+#: * ``include_thoughts``, ``thinking_config``: response shape. ``include_thoughts`` puts the
+#:   model's thought summaries into the reply content the handler returns, and ``thinking_config``
+#:   is the raw form that can carry it. The flat ``thinking_budget`` and ``reasoning_effort`` above
+#:   cover the model settings it holds.
+#: * ``convert_system_message_to_human``: runtime wiring. It changes how the handler's own messages
+#:   are mapped onto the request.
+#: * ``safety_settings``: safety configuration.
+#: * ``labels``: identity and attribution. They tag the request in Google Cloud billing reports.
+#: * ``cached_content``: server-side state. It points the request at context cached on the server.
+#: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
+#:
+#: Named for the drift test and for review, not read at runtime.
+_CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
+    "google_api_key",
+    "api_key",
+    "credentials",
+    "base_url",
+    "client_options",
+    "api_version",
+    "vertexai",
+    "project",
+    "location",
+    "client",
+    "client_args",
+    "additional_headers",
+    "default_metadata",
+    "default_metadata_input",
+    "model_kwargs",
+    "max_retries",
+    "retries",
+    "timeout",
+    "request_timeout",
+    "response_mime_type",
+    "response_schema",
+    "response_modalities",
+    "image_config",
+    "n",
+    "candidate_count",
+    "include_thoughts",
+    "thinking_config",
+    "convert_system_message_to_human",
+    "safety_settings",
+    "labels",
+    "cached_content",
+}
+
 
 def _build_tools(
     config_tools: dict[str, Any], tool_handlers: Mapping[str, Any]
@@ -667,6 +772,27 @@ def _make_default_chat_model(
                 max_retries=max_retries,
             )
         )
+    if provider == "gemini":
+        try:
+            lc_google = importlib.import_module("langchain_google_genai")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Gemini models requires langchain-google-genai. "
+                'Install it with: pip install "launchdarkly-ai-langchain-messages[google]"'
+            ) from exc
+        return lc_google.ChatGoogleGenerativeAI(
+            **_model_constructor_kwargs(
+                config,
+                "",
+                _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS,
+                renames=_CHAT_GOOGLE_GENERATIVE_AI_RENAMES,
+                # ChatGoogleGenerativeAI's max_retries is the genai client's total attempt count,
+                # first request included, and it reads 0 as "use the Google default". One more
+                # than the retry count keeps max_retries=0 meaning no retries, as it does for the
+                # other classes.
+                max_retries=None if max_retries is None else max_retries + 1,
+            )
+        )
     lc_openai = importlib.import_module("langchain_openai")
     return lc_openai.ChatOpenAI(
         **_model_constructor_kwargs(
@@ -793,8 +919,9 @@ def create_langchain_messages_handler(
     Requires ``langchain-openai`` or another LangChain integration to be installed.
     Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
     called after flag evaluation so ``model.parameters`` can be applied unchanged. Omit
-    to default to ``ChatOpenAI`` / ``ChatAnthropic`` constructed at call time from the
-    config's model name and parameters.
+    to default to ``ChatOpenAI`` / ``ChatAnthropic`` / ``ChatBedrockConverse`` /
+    ``ChatGoogleGenerativeAI`` constructed at call time from the config's provider, model name
+    and parameters.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
@@ -808,8 +935,10 @@ def create_langchain_messages_handler(
 
     Set *max_retries* to change how many times the default chat model retries a failed request (a
         rate limit, a timeout, a 5xx) before the error reaches the handler. It is passed to the
-        ``ChatOpenAI``, ``ChatAnthropic`` or ``ChatBedrockConverse`` the handler builds. ``None`` (the
-        default) leaves that class's own default in place, which is 2 for OpenAI and Anthropic. Raise
+        ``ChatOpenAI``, ``ChatAnthropic``, ``ChatBedrockConverse`` or ``ChatGoogleGenerativeAI`` the
+        handler builds. ``ChatGoogleGenerativeAI`` counts attempts rather than retries, so it gets
+        *max_retries* + 1. ``None`` (the default) leaves that class's own default in place, which is
+        2 for OpenAI and Anthropic. Raise
         it when many calls share one rate-limit window, as an evaluation run with many concurrent
         workers does: two retries is thin when a whole batch hits the same window at once. It cannot
         be combined with *llm*, because the handler does not build that model: set ``max_retries`` on

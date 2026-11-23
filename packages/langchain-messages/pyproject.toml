@@ -30,6 +30,7 @@ Repository = "https://github.com/launchdarkly/python-ai-sdk"
 [project.optional-dependencies]
 anthropic = ["langchain-anthropic>=1.4"]
 aws = ["langchain-aws>=1.7"]
+google = ["langchain-google-genai>=4.4"]
 
 [build-system]
 requires = ["hatchling>=1.32,<2"]

@@ -2,13 +2,14 @@
 Drift test for the LangChain chat model parameter classification in ``handler.py``.
 
 ``_CHAT_OPENAI_FORWARDED_KEYS`` / ``_CHAT_ANTHROPIC_FORWARDED_KEYS`` /
-``_CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS`` are literal, hand-maintained lists. This test reads each
+``_CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS`` / ``_CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS`` are literal, hand-maintained lists. This test reads each
 chat model's own ``model_fields`` (field names plus pydantic aliases) and asserts every key it
 accepts is classified in exactly one of forwarded, handler-owned, or excluded, so a field nobody has
 classified yet fails loudly by name, and so does a list entry that is not a real field.
 
-``langchain-aws`` is not a dependency of this package (Bedrock support is opt-in), so the
-``ChatBedrockConverse`` test skips itself when it is not installed.
+``langchain-aws`` and ``langchain-google-genai`` are not dependencies of this package (Bedrock and
+Gemini support are opt-in), so the ``ChatBedrockConverse`` and ``ChatGoogleGenerativeAI`` tests
+skip themselves when they are not installed.
 """
 
 from __future__ import annotations
@@ -29,6 +30,10 @@ from launchdarkly_ai_langchain_messages.handler import (
     _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS,
     _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
     _CHAT_BEDROCK_CONVERSE_OWNED_KEYS,
+    _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS,
+    _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS,
+    _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS,
+    _CHAT_GOOGLE_GENERATIVE_AI_RENAMES,
     _CHAT_OPENAI_EXCLUDED_KEYS,
     _CHAT_OPENAI_FORWARDED_KEYS,
     _CHAT_OPENAI_OWNED_KEYS,
@@ -38,6 +43,7 @@ from launchdarkly_ai_langchain_messages.handler import (
 from tests.forwarding_spec import (
     LANGCHAIN_CHAT_ANTHROPIC,
     LANGCHAIN_CHAT_BEDROCK_CONVERSE,
+    LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI,
     LANGCHAIN_CHAT_OPENAI,
     candidate_keys,
     probe_forwarded_keys,
@@ -159,6 +165,64 @@ class TestChatBedrockConverseAcceptsExactlyTheseKeys:
         )
 
 
+class TestChatGoogleGenerativeAIAcceptsExactlyTheseKeys:
+    def test_every_accepted_key_is_classified_exactly_once(self) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        accepted = _accepted_keys(lc_google.ChatGoogleGenerativeAI)
+        classified = (
+            _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS
+            | _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS
+            | _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS
+        )
+
+        unclassified = accepted - classified
+        assert not unclassified, (
+            f"ChatGoogleGenerativeAI now accepts {sorted(unclassified)}, not classified as "
+            "forwarded, handler-owned, or excluded in langchain-messages handler.py"
+        )
+
+        overlap = (
+            (
+                _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS
+                & _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS
+            )
+            | (
+                _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS
+                & _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS
+            )
+            | (
+                _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS
+                & _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS
+            )
+        )
+        assert not overlap, f"keys classified more than once: {sorted(overlap)}"
+
+    def test_every_classified_key_is_real(self) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        accepted = _accepted_keys(lc_google.ChatGoogleGenerativeAI)
+        stale = (
+            _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS
+            | _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS
+            | _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS
+        ) - accepted
+        assert not stale, (
+            f"{sorted(stale)} classified in langchain-messages handler.py but "
+            "ChatGoogleGenerativeAI does not accept them"
+        )
+
+    def test_every_alias_is_renamed_to_its_field(self) -> None:
+        """Each rename maps a pydantic alias onto the field it belongs to, so a config that sets
+        both spellings reaches the class under one name."""
+        lc_google = pytest.importorskip("langchain_google_genai")
+        fields = lc_google.ChatGoogleGenerativeAI.model_fields
+        aliases = {
+            field.alias: name
+            for name, field in fields.items()
+            if name in _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS and field.alias
+        }
+        assert aliases == dict(_CHAT_GOOGLE_GENERATIVE_AI_RENAMES)
+
+
 class TestModelFieldAliasesAreNeverForwarded:
     """``model_name`` / ``model_id`` are the same constructor field as ``model``. A config value
     for them must not be forwarded, or it would collide with the model the handler resolves."""
@@ -210,6 +274,7 @@ class TestNeverForwardedKeys:
             ("openai", _CHAT_OPENAI_FORWARDED_KEYS),
             ("anthropic", _CHAT_ANTHROPIC_FORWARDED_KEYS),
             ("bedrock", _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS),
+            ("gemini", _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS),
         ],
     )
     def test_constructor_kwargs_hold_none_of_them(
@@ -272,7 +337,12 @@ def _build(provider: str, parameters: dict[str, Any]) -> dict[str, Any]:
     """Runs ``_make_default_chat_model`` for *provider* against a recording constructor and
     returns the kwargs it passed."""
     ctor = MagicMock()
-    module = MagicMock(ChatOpenAI=ctor, ChatAnthropic=ctor, ChatBedrockConverse=ctor)
+    module = MagicMock(
+        ChatOpenAI=ctor,
+        ChatAnthropic=ctor,
+        ChatBedrockConverse=ctor,
+        ChatGoogleGenerativeAI=ctor,
+    )
     importlib = MagicMock()
     importlib.import_module.return_value = module
     _make_default_chat_model(_probe_config(provider, parameters), importlib)
@@ -314,6 +384,12 @@ class TestForwardsExactlyTheCrossSdkList:
                 "ChatBedrockConverse",
                 LANGCHAIN_CHAT_BEDROCK_CONVERSE,
             ),
+            (
+                "gemini",
+                "langchain_google_genai",
+                "ChatGoogleGenerativeAI",
+                LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI,
+            ),
         ],
     )
     async def test_forwarded_keys(
@@ -352,6 +428,7 @@ class TestMalformedObjectValuesAreDropped:
             ("openai", {"logit_bias": "none"}),
             ("anthropic", {"thinking": "enabled", "output_config": "json"}),
             ("bedrock", {"performance_config": "optimized"}),
+            ("gemini", {"thinking_config": {"include_thoughts": True}}),
         ],
     )
     def test_dropped(self, provider: str, parameters: dict[str, Any]) -> None:
@@ -576,3 +653,39 @@ def test_reasoning_effort_keeps_chat_openai_on_chat_completions() -> None:
     assert "messages" in payload
     assert "input" not in payload
     assert "reasoning" not in payload
+
+
+class TestGeminiAliasRenames:
+    """``ChatGoogleGenerativeAI`` takes ``max_tokens``, ``stop_sequences`` and ``thinking_level`` as
+    aliases of ``max_output_tokens``, ``stop`` and ``reasoning_effort``. Each alias is renamed
+    before forwarding, and the field wins when both are set."""
+
+    @pytest.mark.parametrize(
+        ("alias", "field", "alias_value", "field_value"),
+        [
+            ("max_tokens", "max_output_tokens", 300, 200),
+            ("stop_sequences", "stop", ["A"], ["B"]),
+            ("thinking_level", "reasoning_effort", "high", "low"),
+        ],
+    )
+    def test_alias_becomes_the_field_and_the_field_wins(
+        self, alias: str, field: str, alias_value: Any, field_value: Any
+    ) -> None:
+        assert _build("gemini", {alias: alias_value}) == {
+            "model": "configured-model",
+            field: alias_value,
+        }
+        assert _build("gemini", {alias: alias_value, field: field_value}) == {
+            "model": "configured-model",
+            field: field_value,
+        }
+
+    def test_the_real_class_accepts_the_forwarded_kwargs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-not-a-real-key")
+        for key in sorted(LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI):
+            kwargs = _build("gemini", {key: sample(key)})
+            kwargs["model"] = "gemini-3.1-pro-preview"
+            lc_google.ChatGoogleGenerativeAI(**kwargs)

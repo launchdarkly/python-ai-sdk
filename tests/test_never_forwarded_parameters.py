@@ -44,11 +44,13 @@ FORWARDED_LISTS: dict[str, set[str]] = {
         "_CHAT_OPENAI_FORWARDED_KEYS",
         "_CHAT_ANTHROPIC_FORWARDED_KEYS",
         "_CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS",
+        "_CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS",
     },
     "launchdarkly_ai_langchain_messages.handler": {
         "_CHAT_OPENAI_FORWARDED_KEYS",
         "_CHAT_ANTHROPIC_FORWARDED_KEYS",
         "_CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS",
+        "_CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS",
     },
 }
 

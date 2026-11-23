@@ -642,6 +642,8 @@ class TestRootSpanAttributes:
             ("OpenAI", "openai"),
             ("Bedrock", "aws.bedrock"),
             ("bedrock", "aws.bedrock"),
+            ("Gemini", "gemini"),
+            ("gemini", "gemini"),
             ("Azure", "azure"),
             ("Cohere", "cohere"),
             ("Typo", "typo"),
@@ -2946,6 +2948,137 @@ class TestModelSource:
             handler_mod._make_default_chat_model(cfg, imports)
 
     @pytest.mark.asyncio
+    async def test_gemini_routes_to_chat_google_generative_ai(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("gemini")
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {
+                "name": "gemini-3.1-pro-preview",
+                "region": "us",
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens": 256,
+                    "thinking_level": "low",
+                    "google_api_key": "leaked",
+                    "safety_settings": {"HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE"},
+                },
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                sys.modules,
+                {"langchain_google_genai": MagicMock(ChatGoogleGenerativeAI=ctor)},
+            ),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        # Each alias arrives under its field name, and model.region is Bedrock-only.
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "max_output_tokens": 256,
+            "reasoning_effort": "low",
+            "model": "gemini-3.1-pro-preview",
+        }
+
+    def test_gemini_without_langchain_google_genai_has_a_clear_error(self) -> None:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {"name": "gemini-3.1-pro-preview"},
+        }
+        imports = MagicMock()
+        imports.import_module.side_effect = ModuleNotFoundError(
+            "No module named 'langchain_google_genai'"
+        )
+        with pytest.raises(
+            ImportError,
+            match=r"pip install \"launchdarkly-ai-langchain-messages\[google\]\"",
+        ):
+            handler_mod._make_default_chat_model(cfg, imports)
+
+    def test_gemini_builds_the_real_class(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        lc_google = pytest.importorskip("langchain_google_genai")
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {
+                "name": "gemini-3.1-pro-preview",
+                "parameters": {"stop": ["A"], "stop_sequences": ["B"], "top_k": 5},
+            },
+        }
+        model = handler_mod._make_default_chat_model(cfg, importlib)
+        assert isinstance(model, lc_google.ChatGoogleGenerativeAI)
+        assert model.model == "gemini-3.1-pro-preview"
+        # stop_sequences is the alias of stop, and the field wins when both are set.
+        assert model.stop == ["A"]
+        assert model.top_k == 5
+
+    @pytest.mark.asyncio
+    async def test_gemini_reply_is_read_through_the_real_class(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Gemini reply parsed by the real ``ChatGoogleGenerativeAI``, with only the genai network
+        call stubbed: output, usage (cached tokens included), finish reason and provider name all
+        reach the chat span."""
+        pytest.importorskip("langchain_google_genai")
+        from google.genai import types
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        reply = types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    content=types.Content(role="model", parts=[types.Part(text="hi")]),
+                    finish_reason=types.FinishReason.SAFETY,
+                )
+            ],
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=12,
+                candidates_token_count=3,
+                cached_content_token_count=4,
+                total_token_count=15,
+            ),
+        )
+        build = handler_mod._make_default_chat_model
+
+        def stubbed(*args: Any, **kwargs: Any) -> Any:
+            model = build(*args, **kwargs)
+            model.client.aio.models.generate_content = AsyncMock(return_value=reply)
+            return model
+
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {"name": "gemini-3.1-pro-preview"},
+        }
+        ctx, rec = _recording()
+        with ctx, patch.object(handler_mod, "_make_default_chat_model", stubbed):
+            result = await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert result["output"] == "hi"
+        attrs = rec.named("chat ")[0].attributes
+        assert attrs["gen_ai.provider.name"] == "gemini"
+        assert attrs["gen_ai.usage.input_tokens"] == 12
+        assert attrs["gen_ai.usage.output_tokens"] == 3
+        assert attrs["gen_ai.usage.cache_read.input_tokens"] == 4
+        assert list(attrs["gen_ai.response.finish_reasons"]) == ["content_filter"]
+
+    @pytest.mark.asyncio
     async def test_non_bedrock_ignores_model_region(self) -> None:
         ctx, _rec = _recording()
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
@@ -3248,6 +3381,53 @@ class TestMaxRetries:
         # botocore counts attempts, not retries: the first try plus seven retries.
         assert model.client.meta.config.retries["total_max_attempts"] == 8
 
+    def test_value_reaches_the_gemini_constructor_as_attempts(self) -> None:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        ctor = MagicMock()
+        imports = MagicMock()
+        imports.import_module.return_value = MagicMock(ChatGoogleGenerativeAI=ctor)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {"name": "gemini-3.1-pro-preview"},
+        }
+        handler_mod._make_default_chat_model(cfg, imports, max_retries=7)
+        # The genai client counts attempts, not retries: the first try plus seven retries.
+        assert ctor.call_args.kwargs["max_retries"] == 8
+
+    def test_zero_gives_gemini_a_single_attempt(self) -> None:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        ctor = MagicMock()
+        imports = MagicMock()
+        imports.import_module.return_value = MagicMock(ChatGoogleGenerativeAI=ctor)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {"name": "gemini-3.1-pro-preview"},
+        }
+        handler_mod._make_default_chat_model(cfg, imports, max_retries=0)
+        # ChatGoogleGenerativeAI reads 0 as "use the Google default", so 0 retries is 1 attempt.
+        assert ctor.call_args.kwargs["max_retries"] == 1
+
+    def test_value_reaches_the_real_gemini_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        pytest.importorskip("langchain_google_genai")
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Gemini"},
+            "model": {"name": "gemini-3.1-pro-preview", "parameters": {"retries": 50}},
+        }
+        model = handler_mod._make_default_chat_model(cfg, importlib, max_retries=7)
+        assert model.max_retries == 8
+
     @pytest.mark.parametrize(
         ("provider", "module", "cls", "fields"),
         [
@@ -3264,6 +3444,7 @@ class TestMaxRetries:
                 _REAL_CHAT_ANTHROPIC.model_fields,
             ),
             ("Bedrock", "langchain_aws", "ChatBedrockConverse", _FAKE_BEDROCK_FIELDS),
+            ("Gemini", "langchain_google_genai", "ChatGoogleGenerativeAI", {}),
         ],
     )
     def test_omitted_value_is_not_passed_to_any_constructor(

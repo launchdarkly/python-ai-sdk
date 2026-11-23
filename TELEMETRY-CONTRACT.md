@@ -294,6 +294,12 @@ Used by the Anthropic pair and the LangChain pair only. Compare keys lower-cased
 | `tool_calls` | `tool_calls` | OpenAI |
 | `content_filter` | `content_filter` | OpenAI |
 | `function_call` | `tool_calls` | OpenAI |
+| `safety` | `content_filter` | Gemini |
+| `recitation` | `content_filter` | Gemini |
+| `blocklist` | `content_filter` | Gemini |
+| `prohibited_content` | `content_filter` | Gemini |
+| `spii` | `content_filter` | Gemini |
+| `image_safety` | `content_filter` | Gemini |
 
 Anything not in that table passes through unchanged. Do not coerce it to `stop`. A word that
 arrives unmapped is the signal to add a row here.
@@ -309,6 +315,9 @@ choices.
 
 The OpenAI rows exist because the LangChain handlers can serve an OpenAI model and do see these
 words. The two OpenAI handlers never do. See 5a.
+
+The Gemini rows exist because the LangChain handlers build a Gemini model for `provider.name`
+`Gemini`. Gemini's `STOP` and `MAX_TOKENS` already map through the `stop` and `max_tokens` rows.
 
 ### 5a. The two OpenAI handlers derive it instead
 
