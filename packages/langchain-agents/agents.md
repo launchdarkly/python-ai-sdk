@@ -22,7 +22,7 @@ The `'*'` wildcard means this handler acts as a fallback for any `meta.mode == "
 
 > **Priority rule:** if the caller also registers an explicit provider handler (e.g. `['OpenAI', 'agent']`), that handler takes precedence over the wildcard for matching variations.
 
-The handler is model-agnostic — it accepts any `BaseChatModel`. The default is `ChatOpenAI`.
+The handler is model-agnostic: it accepts any `BaseChatModel`. Without one, `_make_default_chat_model` in `handler.py` builds a model from `config.provider.name` (`ChatAnthropic` for `anthropic`, `ChatBedrockConverse` for `bedrock`, `ChatOpenAI` otherwise). `to_lang_graph()` builds each node's default model through the same function, so a provider added there reaches graph nodes too.
 
 ---
 
@@ -41,7 +41,7 @@ The handler is model-agnostic — it accepts any `BaseChatModel`. The default is
 ## Exports
 
 ```python
-# Factory — accepts an optional BaseChatModel; defaults to ChatOpenAI()
+# Factory: accepts an optional BaseChatModel; defaults to a model chosen by config.provider.name
 def create_langchain_agents_handler(llm: BaseChatModel | None = None) -> ProviderHandler: ...
 
 # Convenience wrapper — equivalent to config(key=config_key, handler=create_langchain_agents_handler()).invoke(user_input, context)
@@ -138,7 +138,9 @@ On error: `span.record_exception(err)`, status ERROR, span ended, error re-throw
 
 ### 7. `to_lang_graph()` — native graph adapter
 
-Converts a `resolve_graph()` result into a compiled LangGraph `StateGraph`. Pre-order traversal (root → leaves) registers each node. Single-child edges become direct edges after a tool loop; multi-child edges use `Command`-returning handoff tools (bound with `parallel_tool_calls=False`) so the model picks exactly one target.
+Converts a `resolve_graph()` result into a compiled LangGraph `StateGraph`. Pre-order traversal (root → leaves) registers each node. Single-child edges become direct edges after a tool loop; multi-child edges use `Command`-returning handoff tools so the model picks exactly one target. `parallel_tool_calls` is never passed, because Bedrock Converse rejects it; only the first hand-off in a model turn routes instead.
+
+Each node's chat model comes from `model_factory(node)` when the caller supplies one. Otherwise it is `_make_default_chat_model(node.config)`, the handler's own factory, so a node gets the class, forwarded parameters, and missing-extra `ImportError` that a single-agent call on the same config would get. Do not build a provider model inline here; add the provider to `_make_default_chat_model` instead.
 
 Key implementation detail: `WorkflowState` is a `TypedDict` with an `Annotated[list[Any], add_messages]` field. Because `from __future__ import annotations` defers annotation evaluation, LangGraph's `StateGraph(WorkflowState)` calls `get_type_hints(WorkflowState)` which resolves `add_messages` in the **module's global namespace**. Therefore `add_messages` must be imported at module level — see Common Pitfalls below.
 
@@ -187,7 +189,7 @@ Span names and attributes are described in [Implementation Details → Telemetry
 | Package | Why |
 |---|---|
 | `langchain-core` | `BaseChatModel`, `HumanMessage`, `SystemMessage`, `AIMessage`, `BaseMessage`, `tool()` |
-| `langchain-openai` | `ChatOpenAI` (default model) |
+| `langchain-openai` | `ChatOpenAI` (default model for OpenAI and unrecognised providers) |
 | `langchain` | `create_agent` |
 | `langgraph` | `StateGraph`, `ToolNode`, `tools_condition` |
 | `launchdarkly-ai-server` | `AiConfigRep`, `Tool`, `ProviderHandler`, `parse_template` |

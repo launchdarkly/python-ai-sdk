@@ -32,11 +32,10 @@ from launchdarkly_ai_server import (
     to_ld_context,
     tool_result_string,
 )
-from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import make_graph_track_data, model_parameters
+from launchdarkly_ai_server.utils import make_graph_track_data
 
 from ._version import PACKAGE_NAME, __version__
-from .handler import _CHAT_OPENAI_FORWARDED_KEYS, _CHAT_OPENAI_MAPPING_KEYS
+from .handler import _make_default_chat_model
 from .messages import to_lang_chain_messages
 
 try:
@@ -213,7 +212,9 @@ class LangChainNativeGraphOptions(TypedDict, total=False):
 
     tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
     model_factory: Callable[[GraphNode], Any]
-    """Builds the chat model for a node. Defaults to ``ChatOpenAI``."""
+    """Builds the chat model for a node. Without one, each node gets the model
+    ``create_langchain_agents_handler()`` builds for the node config's ``provider.name``,
+    with ``ChatOpenAI`` for a provider it does not recognise."""
     context: LDContext
     """LaunchDarkly context used for tracking events. Required for LD telemetry."""
 
@@ -320,21 +321,14 @@ def to_lang_graph(
                 is_terminal = node.is_terminal
                 is_multi_child = len(outgoing) > 1
 
-                # Get chat model
+                # The caller's factory wins. Otherwise the node gets the model the
+                # handler would build for the same config: the class follows
+                # provider.name, with that class's forwarded parameters and the
+                # install hint for a missing extra.
                 if model_factory:
                     chat_model = model_factory(node)
                 else:
-                    lc_openai = importlib.import_module("langchain_openai")
-                    model_cfg = node.config.get("model") or {}
-                    kwargs = model_parameters(node.config)
-                    if kwargs:
-                        kwargs = select_forwarded_parameters(
-                            kwargs,
-                            _CHAT_OPENAI_FORWARDED_KEYS,
-                            mapping_keys=_CHAT_OPENAI_MAPPING_KEYS,
-                        )
-                    kwargs["model"] = model_cfg.get("name") or "gpt-4o"
-                    chat_model = lc_openai.ChatOpenAI(**kwargs)
+                    chat_model = _make_default_chat_model(node.config)
 
                 regular_tools = _build_node_tools(node, tool_handlers)
 

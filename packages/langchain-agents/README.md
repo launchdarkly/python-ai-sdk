@@ -113,7 +113,9 @@ asyncio.run(main())
 
 ### Native graph adapter — `to_lang_graph()`
 
-Converts a `resolve_graph()` result into a framework-native LangGraph `StateGraph`. Pre-order traversal (root → leaves) builds a compiled `StateGraph`. Single-child edges become direct edges after a tool loop; multi-child edges use `Command`-returning handoff tools (bound with `parallel_tool_calls=False`) so the model picks exactly one target.
+Converts a `resolve_graph()` result into a framework-native LangGraph `StateGraph`. Pre-order traversal (root → leaves) builds a compiled `StateGraph`. Single-child edges become direct edges after a tool loop; multi-child edges use `Command`-returning handoff tools, and only the first hand-off in a model turn routes, so the model picks exactly one target.
+
+Without a `model_factory`, each node gets the same model the handler builds for that node's config, chosen by its `provider.name`, so one graph can mix providers. A node's provider needs its extra installed, as in [Installation](#installation).
 
 ```python
 import asyncio
@@ -128,7 +130,7 @@ async def main():
             "tool_handlers": registry.tools,
             "context": ctx,
             # optional: supply your own model per node
-            "model_factory": lambda node: ChatOpenAI(model=node["config"]["model"]["name"]),
+            "model_factory": lambda node: ChatOpenAI(model=node.config["model"]["name"]),
         },
     ).invoke("I was double charged")
     print(result["response"])
