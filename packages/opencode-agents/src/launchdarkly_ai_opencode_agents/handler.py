@@ -437,7 +437,8 @@ class _Reducer:
             opened.extend(started)
             opened.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
         if status == "error":
-            self._close_tool_span(call_id, failed=True, result=None)
+            error = state.get("error") if self._capture else None
+            self._close_tool_span(call_id, failed=True, result=error)
             opened.extend(self._emitter.tool_result(call_id, failed=True))
         else:
             output = state.get("output")
@@ -468,10 +469,11 @@ class _Reducer:
         span = self._tool_spans.pop(call_id, None)
         if span is None:
             return
+        set_tool_call_content_attributes(span, self._capture, result=result)
         if failed:
+            span.set_attribute("error.type", "tool_error")
             fail_span(span, OpenCodeSessionError(f"tool call {call_id} failed"))
             return
-        set_tool_call_content_attributes(span, self._capture, result=result)
         succeed_span(span)
 
     def _message(self, info: Mapping[str, Any]) -> list[dict[str, Any]]:
