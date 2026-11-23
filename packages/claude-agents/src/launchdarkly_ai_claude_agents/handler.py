@@ -354,12 +354,12 @@ def build_tool_hooks(
         except Exception as exc:
             # `error or exc`, so a tool that already failed keeps the reason it failed. The
             # serialisation problem is this span's second-worst fact, not its first.
-            fail_span(span, error or exc)
+            fail_span(span, error or exc, error_type="tool_error")
             raise
         if error is None:
             succeed_span(span)
         else:
-            fail_span(span, error)
+            fail_span(span, error, error_type="tool_error")
 
     async def _pre_tool_use(
         input_data: Any, tool_use_id: str | None, hook_context: Any
@@ -416,7 +416,7 @@ def build_tool_hooks(
 
     def close_open_spans(error: BaseException) -> None:
         for span in list(tool_spans.values()):
-            fail_span(span, error)
+            fail_span(span, error, error_type="tool_error")
         tool_spans.clear()
 
     def abandon_open_spans(ended: set[int], cancelled: bool = False) -> None:

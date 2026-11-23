@@ -3274,3 +3274,107 @@ def test_a_streamed_mcp_tool_uses_the_config_name() -> None:
     )
     assert events[0]["toolCallName"] == "search"
     assert events[0]["toolCallId"] == "tu-1"
+
+
+def _hook_input(event: str, use_id: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "hook_event_name": event,
+        "tool_name": f"mcp__tool-mcp__{use_id}",
+        "tool_use_id": use_id,
+        "tool_input": {},
+        **extra,
+    }
+
+
+def _tool_spans_by_id() -> dict[str, Any]:
+    return {s.attributes["gen_ai.tool.call.id"]: s for s in named("execute_tool ")}
+
+
+def _assert_good_ok_bad_tool_error() -> None:
+    tools = _tool_spans_by_id()
+    good, bad = tools["good"], tools["bad"]
+    assert good.status.status_code is StatusCode.OK
+    assert "error.type" not in good.attributes
+    assert good.attributes["gen_ai.tool.call.result"] == "fine"
+    assert bad.status.status_code is StatusCode.ERROR
+    assert bad.attributes["error.type"] == "tool_error"
+    assert "gen_ai.tool.call.result" not in bad.attributes
+
+
+class TestFailedToolSpanErrorType:
+    """TELEMETRY-CONTRACT.md sections 4 and 6: an ERROR tool span carries `error.type`
+    `tool_error` and no result; an OK or abandoned one carries no `error.type`."""
+
+    async def test_a_failure_hook_marks_only_the_failed_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # PostToolUseFailure: the CLI answers the failure to the model and the run continues.
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield assistant_message()
+            hooks = kwargs["options"].hooks
+            pre = hooks["PreToolUse"][0].hooks[0]
+            await pre(_hook_input("PreToolUse", "good"), "good", None)
+            await hooks["PostToolUse"][0].hooks[0](
+                _hook_input("PostToolUse", "good", tool_response="fine"), "good", None
+            )
+            await pre(_hook_input("PreToolUse", "bad"), "bad", None)
+            await hooks["PostToolUseFailure"][0].hooks[0](
+                _hook_input("PostToolUseFailure", "bad", error="boom"), "bad", None
+            )
+            yield result_message("done")
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        await create_claude_agents_handler(capture_content=True)(
+            TOOL_CONFIG, "q", {"search": lambda _: "r"}
+        )
+        _assert_good_ok_bad_tool_error()
+
+    async def test_a_run_that_fails_mid_call_marks_the_open_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield assistant_message()
+            hooks = kwargs["options"].hooks
+            pre = hooks["PreToolUse"][0].hooks[0]
+            await pre(_hook_input("PreToolUse", "good"), "good", None)
+            await hooks["PostToolUse"][0].hooks[0](
+                _hook_input("PostToolUse", "good", tool_response="fine"), "good", None
+            )
+            await pre(_hook_input("PreToolUse", "bad"), "bad", None)
+            raise RuntimeError("agent crashed")
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        with pytest.raises(RuntimeError, match="agent crashed"):
+            await create_claude_agents_handler(capture_content=True)(
+                TOOL_CONFIG, "q", {"search": lambda _: "r"}
+            )
+        _assert_good_ok_bad_tool_error()
+
+    async def test_a_result_that_cannot_be_recorded_is_marked(self) -> None:
+        from launchdarkly_ai_claude_agents.handler import build_tool_hooks
+
+        hooks, _, _, _ = build_tool_hooks({}, None, True)
+        await hooks["PreToolUse"][0].hooks[0](
+            _hook_input("PreToolUse", "bad"), None, None
+        )
+        with pytest.raises(TypeError):
+            await hooks["PostToolUse"][0].hooks[0](
+                _hook_input("PostToolUse", "bad", tool_response=object()), None, None
+            )
+        bad = _tool_spans_by_id()["bad"]
+        assert bad.status.status_code is StatusCode.ERROR
+        assert bad.attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in bad.attributes
+
+    async def test_an_abandoned_call_gets_no_error_type(self) -> None:
+        from launchdarkly_ai_claude_agents.handler import build_tool_hooks
+
+        hooks, _, abandon_open_spans, _ = build_tool_hooks({}, None, True)
+        await hooks["PreToolUse"][0].hooks[0](
+            _hook_input("PreToolUse", "open"), None, None
+        )
+        abandon_open_spans(set())
+        tool = _tool_spans_by_id()["open"]
+        assert tool.status.status_code is StatusCode.UNSET
+        assert tool.attributes["launchdarkly.stream.abandoned"] is True
+        assert "error.type" not in tool.attributes

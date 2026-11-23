@@ -194,7 +194,13 @@ def mark_ok(span: Any) -> None:
     span.set_status(SpanStatusCode.OK)
 
 
-def fail_span(span: Any, error: BaseException, tracker: set[int] | None = None) -> None:
+def fail_span(
+    span: Any,
+    error: BaseException,
+    tracker: set[int] | None = None,
+    *,
+    error_type: str | None = None,
+) -> None:
     """Records the exception, sets ERROR, and ends the span.
 
     *tracker* is passed only from the streaming path, where a ``finally`` may race this to the same
@@ -203,6 +209,8 @@ def fail_span(span: Any, error: BaseException, tracker: set[int] | None = None) 
     if span is None:
         return
     span.record_exception(error)
+    if error_type is not None:
+        span.set_attribute("error.type", error_type)
     span.set_status(SpanStatusCode.ERROR, str(error))
     if tracker is not None:
         end_span_once(span, tracker)
@@ -424,7 +432,7 @@ class SpanCallbackHandler(AsyncCallbackHandler):
             )
             succeed_span(span)
         except Exception as exc:
-            fail_span(span, exc)
+            fail_span(span, exc, error_type="tool_error")
             raise
 
     async def on_tool_error(
@@ -434,14 +442,14 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         span = self.tool_spans.pop(key, None)
         if span is None:
             return
-        fail_span(span, error)
+        fail_span(span, error, error_type="tool_error")
 
     def close_open_spans(self, error: BaseException) -> None:
         """Fails every span this run opened but never closed, for the caller's failure path."""
         for span in self.model_spans.values():
             fail_span(span, error)
         for span in self.tool_spans.values():
-            fail_span(span, error)
+            fail_span(span, error, error_type="tool_error")
         self.model_spans.clear()
         self.tool_spans.clear()
 

@@ -518,7 +518,7 @@ class _SpanningHooks(_RunHooksBase):
                 )
             succeed_span(span)
         except Exception as exc:
-            fail_span(span, exc)
+            fail_span(span, exc, error_type="tool_error")
             raise
 
     def close_open_spans(self, error: BaseException) -> None:
@@ -529,7 +529,7 @@ class _SpanningHooks(_RunHooksBase):
         ``except`` runs. Mirrors the TypeScript handler's ``attachToolSpanHooks(...).closeOpenSpans``.
         """
         for span in self.open_tool_spans.values():
-            fail_span(span, error)
+            fail_span(span, error, error_type="tool_error")
         self.open_tool_spans.clear()
         if self.open_model_span is not None:
             fail_span(self.open_model_span, error)

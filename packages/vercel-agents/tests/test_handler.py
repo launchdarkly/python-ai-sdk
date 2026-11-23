@@ -516,3 +516,116 @@ class TestGraphWrapper:
         handlers = graph_fn.call_args.kwargs["handlers"]
         assert len(handlers) == 1
         assert handlers[0].provides_for == ("*", "agent")
+
+
+def _exported_spans() -> Any:
+    """A real TracerProvider and InMemorySpanExporter behind the handler's tracer lookup."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return patch.object(trace, "get_tracer", provider.get_tracer), exporter
+
+
+def _tool_spans(exporter: Any) -> dict[str, Any]:
+    return {
+        s.attributes["gen_ai.tool.name"]: s
+        for s in exporter.get_finished_spans()
+        if s.name.startswith("execute_tool")
+    }
+
+
+_GOOD_BAD_CONFIG: dict[str, Any] = {
+    **CONFIG,
+    "tools": {
+        "good": {"description": "", "parameters": {}},
+        "bad": {"description": "", "parameters": {}},
+    },
+}
+
+
+class _ToolCallingStream(AgentStream):
+    """Runs the named tools, in order, the way ``ai.Agent`` does mid-run."""
+
+    def __init__(self, runtime: MagicMock, *names: str) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._names = names
+
+    async def __anext__(self) -> Any:
+        tools = {t.name: t for t in self._runtime.Agent.call_args.kwargs["tools"]}
+        for name in self._names:
+            await tools[name].execute()
+        self._names = ()
+        return await super().__anext__()
+
+
+def _tool_calling_runtime(ai_runtime: MagicMock, *names: str) -> None:
+    # One object per tool; the fixture's shared MagicMock return would merge them.
+    ai_runtime.AgentTool = lambda _model_tool, _execute: SimpleNamespace()
+    ai_runtime.Agent.return_value.run = MagicMock(
+        return_value=_ToolCallingStream(ai_runtime, *names)
+    )
+
+
+class TestFailedToolSpanErrorType:
+    """TELEMETRY-CONTRACT.md sections 4 and 6: an ERROR tool span carries `error.type`
+    `tool_error` and no result; an OK or cancelled one carries no `error.type`."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_marks_only_the_failed_call(
+        self, ai_runtime: MagicMock, path: str
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        _tool_calling_runtime(ai_runtime, "good", "bad")
+        handlers = {
+            "good": AsyncMock(return_value="fine"),
+            "bad": AsyncMock(side_effect=RuntimeError("tool exploded")),
+        }
+        handler = create_vercel_agents_handler(capture_content=True)
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(RuntimeError, match="tool exploded"):
+            if path == "invoke":
+                await handler(_GOOD_BAD_CONFIG, "hello", handlers)
+            else:
+                async for _ in await handler.stream(
+                    _GOOD_BAD_CONFIG, "hello", handlers
+                ):
+                    pass
+
+        tools = _tool_spans(exporter)
+        good, bad = tools["good"], tools["bad"]
+        assert good.status.status_code is StatusCode.OK
+        assert "error.type" not in good.attributes
+        assert bad.status.status_code is StatusCode.ERROR
+        assert bad.attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in bad.attributes
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_tool_call_gets_no_error_type(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        _tool_calling_runtime(ai_runtime, "good")
+        handler = create_vercel_agents_handler(capture_content=True)
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(asyncio.CancelledError):
+            await handler(
+                _GOOD_BAD_CONFIG,
+                "hello",
+                {"good": AsyncMock(side_effect=asyncio.CancelledError())},
+            )
+
+        tool = _tool_spans(exporter)["good"]
+        assert tool.status.status_code is StatusCode.UNSET
+        assert tool.attributes["launchdarkly.run.cancelled"] is True
+        assert "error.type" not in tool.attributes

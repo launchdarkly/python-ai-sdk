@@ -769,3 +769,127 @@ class TestUnofferedToolsFailClosed:
             async for _ in await handler.stream(config, "hello", handlers):
                 pass
         assert [tool.name for tool in _stream_kwargs(ai_runtime)["tools"]] == ["safe"]
+
+
+def _exported_spans() -> Any:
+    """A real TracerProvider and InMemorySpanExporter behind the handler's tracer lookup."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return patch.object(trace, "get_tracer", provider.get_tracer), exporter
+
+
+def _tool_spans(exporter: Any) -> dict[str, Any]:
+    return {
+        s.attributes["gen_ai.tool.name"]: s
+        for s in exporter.get_finished_spans()
+        if s.name.startswith("execute_tool")
+    }
+
+
+_GOOD_BAD_CONFIG: dict[str, Any] = {
+    **CONFIG,
+    "tools": {
+        "good": {"description": "", "parameters": {}},
+        "bad": {"description": "", "parameters": {}},
+    },
+}
+
+
+def _calls(*names: str) -> list[Any]:
+    return [
+        SimpleNamespace(tool_call_id=f"tc-{n}", tool_name=n, tool_args={})
+        for n in names
+    ]
+
+
+class TestFailedToolSpanErrorType:
+    """TELEMETRY-CONTRACT.md sections 4 and 6: an ERROR tool span carries `error.type`
+    `tool_error` and no result; an OK or cancelled one carries no `error.type`."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_a_failure_answered_to_the_model_is_marked(
+        self, ai_runtime: MagicMock, path: str
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        ai_runtime.stream.side_effect = [
+            FakeStream(text="", tool_calls=_calls("good", "bad")),
+            FakeStream(text="recovered"),
+        ]
+        handlers = {
+            "good": AsyncMock(return_value="fine"),
+            "bad": AsyncMock(side_effect=RuntimeError("upstream down")),
+        }
+        handler = create_vercel_messages_handler(capture_content=True)
+        ctx, exporter = _exported_spans()
+        with ctx:
+            if path == "invoke":
+                await handler(_GOOD_BAD_CONFIG, "hello", handlers)
+            else:
+                async for _ in await handler.stream(
+                    _GOOD_BAD_CONFIG, "hello", handlers
+                ):
+                    pass
+
+        # The model still gets the error text; the span does not.
+        ai_runtime.tool_result_part.assert_any_call(
+            "tc-bad", tool_name="bad", result="upstream down", is_error=True
+        )
+        tools = _tool_spans(exporter)
+        good, bad = tools["good"], tools["bad"]
+        assert good.status.status_code is StatusCode.OK
+        assert "error.type" not in good.attributes
+        assert bad.status.status_code is StatusCode.ERROR
+        assert bad.attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in bad.attributes
+
+    @pytest.mark.asyncio
+    async def test_a_tool_not_offered_is_marked(self, ai_runtime: MagicMock) -> None:
+        from opentelemetry.trace import StatusCode
+
+        ai_runtime.stream.side_effect = [
+            FakeStream(text="", tool_calls=_calls("good", "ghost"))
+        ]
+        handler = create_vercel_messages_handler(capture_content=True)
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(ValueError, match='tool "ghost"'):
+            await handler(
+                _GOOD_BAD_CONFIG, "hello", {"good": AsyncMock(return_value="fine")}
+            )
+
+        tools = _tool_spans(exporter)
+        assert tools["good"].status.status_code is StatusCode.OK
+        assert "error.type" not in tools["good"].attributes
+        assert tools["ghost"].status.status_code is StatusCode.ERROR
+        assert tools["ghost"].attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in tools["ghost"].attributes
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_tool_call_gets_no_error_type(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        ai_runtime.stream.side_effect = [FakeStream(text="", tool_calls=_calls("good"))]
+        handler = create_vercel_messages_handler(capture_content=True)
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(asyncio.CancelledError):
+            await handler(
+                _GOOD_BAD_CONFIG,
+                "hello",
+                {"good": AsyncMock(side_effect=asyncio.CancelledError())},
+            )
+
+        tool = _tool_spans(exporter)["good"]
+        assert tool.status.status_code is StatusCode.UNSET
+        assert tool.attributes["launchdarkly.run.cancelled"] is True
+        assert "error.type" not in tool.attributes

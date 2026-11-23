@@ -540,6 +540,11 @@ invoke_agent                     one per call. Carries the LaunchDarkly identity
 
 Tool spans are siblings of `chat`, not children of it. Both hang off the root.
 
+A tool call that ends in error, including one the run was still in when it failed, ends its span
+ERROR with the exception recorded and `error.type` set to `tool_error`, and writes no tool result.
+A call cut short by cancellation or by a consumer that stopped reading a stream is left unset, with
+no `error.type`.
+
 The root is the only span carrying `launchdarkly.config.key`, `launchdarkly.variation.key`,
 `launchdarkly.run.id` and the `feature_flag` event. That is what a config-scoped query in AI Config
 Monitoring finds, which is also why the root carries a run total: summing the children requires

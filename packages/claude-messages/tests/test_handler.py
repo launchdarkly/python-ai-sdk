@@ -3382,3 +3382,113 @@ class TestUnofferedToolsFailClosed:
                 pass
             sent = mock_anthropic.messages.stream.call_args.kwargs["tools"]
         assert [t["name"] for t in sent] == ["safe"]
+
+
+def _exported_spans() -> Any:
+    """A real TracerProvider and InMemorySpanExporter behind the handler's tracer lookup."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return patch.object(trace, "get_tracer", provider.get_tracer), exporter
+
+
+def _tool_spans(exporter: Any) -> dict[str, Any]:
+    return {
+        s.attributes["gen_ai.tool.name"]: s
+        for s in exporter.get_finished_spans()
+        if s.name.startswith("execute_tool")
+    }
+
+
+_GOOD_BAD_CONFIG = {
+    **CONFIG,
+    "tools": {
+        "good": {"type": "function", "parameters": {}},
+        "bad": {"type": "function", "parameters": {}},
+    },
+}
+
+
+def _bad(_args: Any) -> Any:
+    raise RuntimeError("tool exploded")
+
+
+class TestFailedToolSpanErrorType:
+    """TELEMETRY-CONTRACT.md sections 4 and 6: an ERROR tool span carries `error.type`
+    `tool_error` and no result; an OK or cancelled one carries no `error.type`."""
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_marks_only_the_failed_call(
+        self, mock_anthropic: MagicMock, path: str
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        blocks = [_tool_use_block("good", "c1"), _tool_use_block("bad", "c2")]
+        handlers = {"good": lambda _args: "fine", "bad": _bad}
+        h = create_claude_messages_handler(capture_content=True)
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(RuntimeError, match="tool exploded"):
+            if path == "invoke":
+                mock_anthropic.messages.create = AsyncMock(
+                    return_value=_anthropic_response(blocks, stop_reason="tool_use")
+                )
+                await h(_GOOD_BAD_CONFIG, "q", handlers, {})
+            else:
+                stream_ctx, final = _make_stream_context([])
+                final.stop_reason = "tool_use"
+                final.content = blocks
+                mock_anthropic.messages.stream = MagicMock(return_value=stream_ctx)
+                async for _ in await h.stream(_GOOD_BAD_CONFIG, "q", handlers, {}):
+                    pass
+
+        tools = _tool_spans(exporter)
+        good, bad = tools["good"], tools["bad"]
+        assert good.status.status_code is StatusCode.OK
+        assert "error.type" not in good.attributes
+        assert good.attributes["gen_ai.tool.call.result"] == "fine"
+        assert bad.status.status_code is StatusCode.ERROR
+        assert bad.attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in bad.attributes
+
+    async def test_a_cancelled_tool_call_gets_no_error_type(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import asyncio
+
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        async def hangs(_args: Any) -> Any:
+            await asyncio.sleep(3600)
+
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_anthropic_response(
+                [_tool_use_block("good", "c1")], stop_reason="tool_use"
+            )
+        )
+        ctx, exporter = _exported_spans()
+        with ctx:
+            task = asyncio.create_task(
+                create_claude_messages_handler(capture_content=True)(
+                    _GOOD_BAD_CONFIG, "q", {"good": hangs}, {}
+                )
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        tool = _tool_spans(exporter)["good"]
+        assert tool.status.status_code is StatusCode.UNSET
+        assert tool.attributes["launchdarkly.run.cancelled"] is True
+        assert "error.type" not in tool.attributes

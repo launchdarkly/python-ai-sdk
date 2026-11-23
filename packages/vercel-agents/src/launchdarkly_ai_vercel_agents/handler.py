@@ -310,7 +310,7 @@ def build_agent_tools(
             except BaseException as exc:
                 if tool_span is not None:
                     if isinstance(exc, Exception):
-                        fail_span(tool_span, exc)
+                        fail_span(tool_span, exc, error_type="tool_error")
                     else:
                         tool_span.set_attribute("launchdarkly.run.cancelled", True)
                         tool_span.end()

@@ -372,8 +372,12 @@ def _succeed(span: Any, ended: set[int]) -> None:
     end_span_once(span, ended)
 
 
-def _fail(span: Any, error: BaseException, ended: set[int]) -> None:
+def _fail(
+    span: Any, error: BaseException, ended: set[int], *, error_type: str | None = None
+) -> None:
     span.record_exception(error)
+    if error_type is not None:
+        span.set_attribute("error.type", error_type)
     span.set_status(StatusCode.ERROR, str(error))
     end_span_once(span, ended)
 
@@ -479,12 +483,12 @@ class _SpanningHooks(RunHooksBase[Any, Any]):
                 set_tool_call_content_attributes(span, True, result=result)
             _succeed(span, self.ended)
         except Exception as exc:
-            _fail(span, exc, self.ended)
+            _fail(span, exc, self.ended, error_type="tool_error")
             raise
 
     def fail_open(self, error: BaseException) -> None:
         for span in self.open_tools.values():
-            _fail(span, error, self.ended)
+            _fail(span, error, self.ended, error_type="tool_error")
         self.open_tools.clear()
         if self.open_model is not None:
             _fail(self.open_model, error, self.ended)

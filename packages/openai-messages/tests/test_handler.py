@@ -3253,3 +3253,109 @@ class TestUnofferedToolsFailClosed:
                 pass
             sent = mock_openai.responses.stream.call_args.kwargs["tools"]
         assert [t["name"] for t in sent] == ["safe"]
+
+
+def _exported_spans() -> Any:
+    """A real TracerProvider and InMemorySpanExporter behind the handler's tracer lookup."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return patch.object(trace, "get_tracer", provider.get_tracer), exporter
+
+
+def _tool_spans(exporter: Any) -> dict[str, Any]:
+    return {
+        s.attributes["gen_ai.tool.name"]: s
+        for s in exporter.get_finished_spans()
+        if s.name.startswith("execute_tool")
+    }
+
+
+def _bad(_args: Any) -> Any:
+    raise RuntimeError("tool exploded")
+
+
+_GOOD_BAD_CALLS = [{"name": "good", "call_id": "c1"}, {"name": "bad", "call_id": "c2"}]
+
+
+def _patch_good_bad(mock_openai: MagicMock, path: str) -> None:
+    if path == "invoke":
+        mock_openai.responses.create = AsyncMock(
+            return_value=_make_response(tool_calls=_GOOD_BAD_CALLS)
+        )
+    else:
+        items = [_function_call_item(c["name"], c["call_id"]) for c in _GOOD_BAD_CALLS]
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context([], output=items)
+        )
+
+
+class TestFailedToolSpanErrorType:
+    """TELEMETRY-CONTRACT.md sections 4 and 6: an ERROR tool span carries `error.type`
+    `tool_error` and no result; an OK or cancelled one carries no `error.type`."""
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_marks_only_the_failed_call(
+        self, mock_openai: MagicMock, path: str
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        _patch_good_bad(mock_openai, path)
+        handlers = {"good": lambda _args: "fine", "bad": _bad}
+        h = create_openai_messages_handler(capture_content=True)
+        cfg = _with_tools(CONFIG, "good", "bad")
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(RuntimeError, match="tool exploded"):
+            if path == "invoke":
+                await h(cfg, "q", handlers, {})
+            else:
+                async for _ in await h.stream(cfg, "q", handlers, {}):
+                    pass
+
+        tools = _tool_spans(exporter)
+        good, bad = tools["good"], tools["bad"]
+        assert good.status.status_code is StatusCode.OK
+        assert "error.type" not in good.attributes
+        assert good.attributes["gen_ai.tool.call.result"] == "fine"
+        assert bad.status.status_code is StatusCode.ERROR
+        assert bad.attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in bad.attributes
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_a_cancelled_tool_call_gets_no_error_type(
+        self, mock_openai: MagicMock, path: str
+    ) -> None:
+        import asyncio
+
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        async def _cancelled(_args: Any) -> Any:
+            raise asyncio.CancelledError()
+
+        _patch_good_bad(mock_openai, path)
+        handlers = {"good": _cancelled, "bad": _bad}
+        h = create_openai_messages_handler(capture_content=True)
+        cfg = _with_tools(CONFIG, "good", "bad")
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(asyncio.CancelledError):
+            if path == "invoke":
+                await h(cfg, "q", handlers, {})
+            else:
+                async for _ in await h.stream(cfg, "q", handlers, {}):
+                    pass
+
+        tool = _tool_spans(exporter)["good"]
+        assert tool.status.status_code is StatusCode.UNSET
+        assert tool.attributes["launchdarkly.run.cancelled"] is True
+        assert "error.type" not in tool.attributes
