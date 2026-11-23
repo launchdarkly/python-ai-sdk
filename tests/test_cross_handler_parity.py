@@ -302,6 +302,8 @@ class TestModelIdentity:
             ("OpenAI", "openai"),
             ("Bedrock", "aws.bedrock"),
             ("bedrock", "aws.bedrock"),
+            ("Gemini", "gcp.gemini"),
+            ("gemini", "gcp.gemini"),
             ("Azure", "azure"),
             ("", "openai"),
         ):
@@ -322,6 +324,20 @@ class TestModelIdentity:
             attrs = tracer.spans[0].attributes
             assert attrs["gen_ai.provider.name"] == "aws.bedrock", configured
             assert attrs["gen_ai.system"] == "aws.bedrock", configured
+
+    def test_a_gemini_config_writes_gcp_gemini(self, handler_spans: Any) -> None:
+        # Semconv names the Gemini API `gcp.gemini`, mapped the same way as Bedrock.
+        package, module, tracer = handler_spans
+        if package not in ("opencode-agents", "vercel-messages", "vercel-agents"):
+            pytest.skip(
+                "covers the handlers that put the configured provider on both keys"
+            )
+        for configured in ("Gemini", "gemini"):
+            tracer.spans.clear()
+            module.start_root_span({**CONFIG, "provider": {"name": configured}}, {})
+            attrs = tracer.spans[0].attributes
+            assert attrs["gen_ai.provider.name"] == "gcp.gemini", configured
+            assert attrs["gen_ai.system"] == "gcp.gemini", configured
 
 
 # ─── The vocabulary lock ─────────────────────────────────────────────────────

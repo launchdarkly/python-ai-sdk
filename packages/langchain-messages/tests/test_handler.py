@@ -642,8 +642,8 @@ class TestRootSpanAttributes:
             ("OpenAI", "openai"),
             ("Bedrock", "aws.bedrock"),
             ("bedrock", "aws.bedrock"),
-            ("Gemini", "gemini"),
-            ("gemini", "gemini"),
+            ("Gemini", "gcp.gemini"),
+            ("gemini", "gcp.gemini"),
             ("Azure", "azure"),
             ("Cohere", "cohere"),
             ("Typo", "typo"),
@@ -3072,7 +3072,7 @@ class TestModelSource:
             result = await create_langchain_messages_handler()(cfg, "q", {}, {})
         assert result["output"] == "hi"
         attrs = rec.named("chat ")[0].attributes
-        assert attrs["gen_ai.provider.name"] == "gemini"
+        assert attrs["gen_ai.provider.name"] == "gcp.gemini"
         assert attrs["gen_ai.usage.input_tokens"] == 12
         assert attrs["gen_ai.usage.output_tokens"] == 3
         assert attrs["gen_ai.usage.cache_read.input_tokens"] == 4

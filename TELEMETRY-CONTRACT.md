@@ -663,13 +663,14 @@ Python matches TypeScript here. The Python LangChain handlers put the literal `l
 `gen_ai.system` (`LEGACY_SYSTEM` in `launchdarkly_ai_langchain_messages/spans.py`).
 
 `gen_ai.provider.name` on the two LangChain handlers is a passthrough of the configured provider
-(`serving_provider`): the name lower-cased, `openai` when it is unset or empty, with one mapping:
-a name that lower-cases to `bedrock` is written `aws.bedrock`, its semconv value. Azure, Cohere,
-a typo and any other name pass through lower-cased.
+(`serving_provider`): the name lower-cased, `openai` when it is unset or empty, with two mappings
+to semconv values: a name that lower-cases to `bedrock` is written `aws.bedrock`, and one that
+lower-cases to `gemini` is written `gcp.gemini`. Azure, Cohere, a typo and any other name pass
+through lower-cased.
 
 Evaluation spans write the configured provider on both keys (`_provider_name` in
-`launchdarkly_ai_server/evaluations/spans.py`): lower-cased, `aws.bedrock` for Bedrock, and
-empty, not `openai`, when no provider is configured.
+`launchdarkly_ai_server/evaluations/spans.py`): lower-cased, `aws.bedrock` for Bedrock, `gcp.gemini` for
+Gemini, and empty, not `openai`, when no provider is configured.
 
 ---
 

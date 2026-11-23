@@ -954,6 +954,7 @@ def test_evaluation_result_carries_the_zero_to_one_range(
         ("OpenAI", "openai"),
         ("Bedrock", "aws.bedrock"),
         ("bedrock", "aws.bedrock"),
+        ("Gemini", "gcp.gemini"),
         ("", ""),
     ],
 )
