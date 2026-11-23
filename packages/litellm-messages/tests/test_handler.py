@@ -1119,3 +1119,5 @@ class TestFailedToolSpanErrorType:
         for tool in tools.values():
             assert tool.status.status_code is StatusCode.UNSET
             assert "error.type" not in tool.attributes
+            assert tool.attributes.get("launchdarkly.run.cancelled") is True
+            assert "launchdarkly.stream.abandoned" not in tool.attributes

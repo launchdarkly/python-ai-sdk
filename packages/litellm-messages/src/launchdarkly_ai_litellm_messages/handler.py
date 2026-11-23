@@ -448,7 +448,9 @@ async def _execute_tools(
             _fail_span(span, exc, ended, error_type="tool_error")
             raise
         finally:
-            end_span_once(span, ended, abandoned=True)
+            # Only a BaseException (in practice CancelledError) reaches here with the span open:
+            # a generator cannot be abandoned while awaiting a tool.
+            end_span_once(span, ended, cancelled=True)
 
     return await asyncio.gather(*(execute(call) for call in calls))
 
