@@ -1,6 +1,7 @@
 """Tests for experimental shadow requests (``shadow_config``)."""
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import pickle
@@ -678,7 +679,9 @@ class TestRunning:
         )
         assert response.response == "real answer"
         assert "$ld:ai:generation:success" in [e[0] for e in _real_events(client)]
-        assert "$ld:ai:generation:error" in [e[0] for e in _shadow_events(client)]
+        assert "$ld:ai-shadow:generation:error" in [
+            e[0] for e in _shadow_events(client)
+        ]
 
     async def test_timed_out_shadow_never_reaches_the_caller(self) -> None:
         client = _make_client(_variation_a())
@@ -704,9 +707,9 @@ class TestRunning:
         assert result.error == "timeout"
         assert result.track_data["configKey"] == "flag"
         assert result.track_data["variationKey"] == "b"
-        assert names.count("$ld:ai:generation:error") == 1
-        assert names.count("$ld:ai:duration:total") == 1
-        assert "$ld:ai:generation:success" not in names
+        assert names.count("$ld:ai-shadow:generation:error") == 1
+        assert names.count("$ld:ai-shadow:duration:total") == 1
+        assert "$ld:ai-shadow:generation:success" not in names
 
     async def test_handler_timeout_error_is_an_ordinary_failure(self) -> None:
         client = _make_client(_variation_a())
@@ -715,7 +718,7 @@ class TestRunning:
         result = await run_shadow(task, [b.handler])
         names = [e[0] for e in _shadow_events(client)]
         assert result.error == "provider timeout"
-        assert names.count("$ld:ai:generation:error") == 1
+        assert names.count("$ld:ai-shadow:generation:error") == 1
 
     async def test_shutdown_cancels_running_shadows(self) -> None:
         _use(_make_client(_variation_a()))
@@ -917,9 +920,9 @@ class TestEvents:
         response, _, _ = await _invoke(client)
         events = _shadow_events(client)
         assert {e[0] for e in events} >= {
-            "$ld:ai:duration:total",
-            "$ld:ai:generation:success",
-            "$ld:ai:tokens:total",
+            "$ld:ai-shadow:duration:total",
+            "$ld:ai-shadow:generation:success",
+            "$ld:ai-shadow:tokens:total",
         }
         data = events[0][1]
         assert data["configKey"] == "flag"
@@ -1009,8 +1012,8 @@ class TestFailureEdges:
         result = await run_shadow(task, [handler])
         names = [e[0] for e in _shadow_events(client)]
         assert result.error == "timeout"
-        assert "$ld:ai:generation:success" not in names
-        assert names.count("$ld:ai:generation:error") == 1
+        assert "$ld:ai-shadow:generation:success" not in names
+        assert names.count("$ld:ai-shadow:generation:error") == 1
 
     async def test_error_without_a_message_uses_the_type_name(self) -> None:
         task = await _deferred_task(_make_client(_variation_a()))
@@ -1114,7 +1117,11 @@ def _judged_client(
 
 
 def _judge_events(client: MagicMock) -> list[dict[str, Any]]:
-    return [d for n, d in _events(client) if n == "judge-score"]
+    return [
+        d
+        for n, d in _events(client)
+        if n in ("judge-score", "$ld:ai-shadow:judge-score")
+    ]
 
 
 async def _invoke_judged(
@@ -1269,7 +1276,9 @@ class TestJudges:
         assert len(judge.calls) == 1
         assert result.error is None
         assert result.judge_results is None
-        assert "$ld:ai:generation:success" in [e[0] for e in _shadow_events(client)]
+        assert "$ld:ai-shadow:generation:success" in [
+            e[0] for e in _shadow_events(client)
+        ]
         assert any("Judge 'j' failed" in m for m in caplog.messages)
 
     async def test_one_judge_failing_leaves_the_others_scoring(
@@ -1379,3 +1388,300 @@ async def _deferred_task_judged(client: MagicMock) -> ShadowTask:
     await _invoke_judged(client, on_task=tasks.append)
     assert len(tasks) == 1
     return tasks[0]
+
+
+def _calls(client: MagicMock) -> list[tuple[str, dict[str, Any]]]:
+    return [(c[0][0], c[0][2]) for c in client.track.call_args_list]
+
+
+def _keys(events: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    return [n for n, _ in events if n not in BOOKKEEPING]
+
+
+def _expected_shadow_key(key: str) -> str:
+    if key.startswith("$ld:ai-shadow:"):
+        return key
+    if key.startswith("$ld:ai:"):
+        return "$ld:ai-shadow:" + key[len("$ld:ai:") :]
+    return "$ld:ai-shadow:" + key
+
+
+def _key_client(metric_key: str = "judge-score", *, a_judged: bool = True) -> MagicMock:
+    """A client whose served variation A and shadow variation B each have one
+    judge ``j`` at rate 1, scored on *metric_key*."""
+    judge = {**_judge_variation(), "evaluationMetricKey": metric_key}
+    value = _variation_a(
+        variations={"b": _variation_b(judges=[{"key": "j", "samplingRate": 1}])}
+    )
+    if a_judged:
+        value["judgeConfiguration"] = {"judges": [{"key": "j", "samplingRate": 1}]}
+    client = _make_client(value)
+
+    async def variation(key: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return judge if key == "j" else value
+
+    client.variation = AsyncMock(side_effect=variation)
+    return client
+
+
+def _b_outcome(outcome: str) -> _Recorder:
+    if outcome == "failure":
+        return _Recorder("ShadowProvider", error=RuntimeError("boom"))
+    if outcome == "timeout":
+        return _Recorder("ShadowProvider", sleep_s=1)
+    return _Recorder("ShadowProvider", "shadow answer")
+
+
+async def _config_keys(
+    variation: dict[str, Any], outcome: str, metric_key: str = "judge-score"
+) -> list[str]:
+    """The keys ``config().invoke()`` sends running *variation* with one judge,
+    for *outcome*. A timeout is a handler failure to ``config()``."""
+    lifecycle_module._reset_for_testing()
+    judge = {**_judge_variation(), "evaluationMetricKey": metric_key}
+    client = _make_client(variation)
+
+    async def resolve(key: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return judge if key == "j" else variation
+
+    client.variation = AsyncMock(side_effect=resolve)
+    _use(client)
+    provider = variation["provider"]["name"]
+    handler = (
+        _Recorder(provider, error=RuntimeError("boom"))
+        if outcome != "success"
+        else _Recorder(provider, "shadow answer")
+    )
+    with contextlib.suppress(Exception):
+        await config(
+            key="flag",
+            handler=[
+                handler.handler,
+                _Recorder("JudgeProvider", JUDGE_VERDICT).handler,
+            ],
+        ).invoke("question", CONTEXT)
+    keys = _keys(_calls(client))
+    lifecycle_module._reset_for_testing()
+    return keys
+
+
+def _b_as_served() -> dict[str, Any]:
+    b = _variation_b(judges=[{"key": "j", "samplingRate": 1}])
+    return {k: v for k, v in b.items() if k != "tools"}
+
+
+def _a_as_served() -> dict[str, Any]:
+    a = _variation_a()
+    a.pop("shadowConfiguration")
+    a["judgeConfiguration"] = {"judges": [{"key": "j", "samplingRate": 1}]}
+    return a
+
+
+async def _background_run(
+    outcome: str, metric_key: str = "judge-score"
+) -> tuple[list[tuple[str, dict[str, Any]]], list[tuple[str, dict[str, Any]]], Any]:
+    """Runs A with one judge and a background B with one judge. Returns A's
+    events, the events sent once A returned (the shadow's), and A's response."""
+    client = _use(_key_client(metric_key))
+    instance = shadow_config(
+        key="flag",
+        handler=[
+            _Recorder("TestProvider", "real answer").handler,
+            _b_outcome(outcome).handler,
+            _Recorder("JudgeProvider", JUDGE_VERDICT).handler,
+        ],
+        shadow_timeout_s=0.05,
+    )
+    response = await instance.invoke("question", CONTEXT)
+    served = len(client.track.call_args_list)
+    await sr._wait_for_shadows_for_testing()
+    calls = _calls(client)
+    return calls[:served], calls[served:], response
+
+
+async def _deferred_run(
+    outcome: str, metric_key: str = "judge-score"
+) -> list[tuple[str, dict[str, Any]]]:
+    """Builds a task for B with one judge and returns every event ``run_shadow``
+    sends for it."""
+    client = _use(_key_client(metric_key, a_judged=False))
+    tasks: list[ShadowTask] = []
+    await shadow_config(
+        key="flag",
+        handler=[
+            _Recorder("TestProvider", "real answer").handler,
+            _Recorder("ShadowProvider").handler,
+        ],
+        on_task=tasks.append,
+    ).invoke("question", CONTEXT)
+    task = dataclasses.replace(tasks[0], timeout_s=0.05)
+    client.track.reset_mock()
+    await run_shadow(
+        task,
+        [
+            _b_outcome(outcome).handler,
+            _Recorder("JudgeProvider", JUDGE_VERDICT).handler,
+        ],
+    )
+    return _calls(client)
+
+
+def _is_run_shadow_usage(event: tuple[str, dict[str, Any]]) -> bool:
+    name, data = event
+    return name == "$ld:ai:sdk:usage" and data.get("helper") == "experimental.runShadow"
+
+
+OUTCOMES = ["success", "failure", "timeout"]
+
+
+class TestShadowEventKeys:
+    @pytest.mark.parametrize(
+        ("key", "expected"),
+        [
+            ("$ld:ai:tokens:input", "$ld:ai-shadow:tokens:input"),
+            ("$ld:ai:generation:error", "$ld:ai-shadow:generation:error"),
+            ("$ld:ai:judge:relevance", "$ld:ai-shadow:judge:relevance"),
+            ("my-relevance", "$ld:ai-shadow:my-relevance"),
+            ("$ld:ai-shadow:tokens:input", "$ld:ai-shadow:tokens:input"),
+            ("$ld:ai:shadow:x", "$ld:ai-shadow:shadow:x"),
+            ("$ld:aix", "$ld:ai-shadow:$ld:aix"),
+        ],
+    )
+    def test_key_mapping(self, key: str, expected: str) -> None:
+        assert sr._shadow_event_key(key) == expected
+
+    @pytest.mark.parametrize("outcome", OUTCOMES)
+    async def test_background_shadow_keys(self, outcome: str) -> None:
+        served, shadow, _ = await _background_run(outcome)
+        shadow_keys = _keys(shadow)
+        assert shadow_keys
+        assert not [k for k in shadow_keys if k.startswith("$ld:ai:")]
+        expected = await _config_keys(_b_as_served(), outcome)
+        assert shadow_keys == [_expected_shadow_key(k) for k in expected]
+        if outcome == "success":
+            assert shadow_keys.count("$ld:ai-shadow:generation:success") == 2
+            assert shadow_keys[-1] == "$ld:ai-shadow:judge-score"
+        else:
+            assert shadow_keys == [
+                "$ld:ai-shadow:duration:total",
+                "$ld:ai-shadow:generation:error",
+            ]
+
+        served_keys = _keys(served)
+        assert served_keys == await _config_keys(_a_as_served(), "success")
+        assert not [k for k in served_keys if k.startswith("$ld:ai-shadow:")]
+
+    @pytest.mark.parametrize("outcome", OUTCOMES)
+    async def test_run_shadow_keys(self, outcome: str) -> None:
+        events = await _deferred_run(outcome)
+        stray = [
+            n
+            for n, d in events
+            if n.startswith("$ld:ai:") and not _is_run_shadow_usage((n, d))
+        ]
+        assert stray == []
+        assert any(_is_run_shadow_usage(e) for e in events)
+        expected = await _config_keys(_b_as_served(), outcome)
+        assert _keys(events) == [_expected_shadow_key(k) for k in expected]
+
+    async def test_background_and_deferred_send_the_same_keys(self) -> None:
+        _, background, _ = await _background_run("success")
+        lifecycle_module._reset_for_testing()
+        reset_sdk_usage()
+        deferred = await _deferred_run("success")
+        assert _keys(background) == _keys(deferred)
+
+    @pytest.mark.parametrize(
+        ("metric_key", "sent"),
+        [
+            ("my-relevance", "$ld:ai-shadow:my-relevance"),
+            ("$ld:ai:judge:relevance", "$ld:ai-shadow:judge:relevance"),
+            ("$ld:ai-shadow:judge:relevance", "$ld:ai-shadow:judge:relevance"),
+        ],
+    )
+    async def test_judge_score_key(self, metric_key: str, sent: str) -> None:
+        served, shadow, response = await _background_run("success", metric_key)
+        scores = [(n, d) for n, d in shadow if "judgeConfigKey" in d]
+        assert [n for n, _ in scores] == [sent]
+        data = scores[0][1]
+        assert data["isShadow"] is True
+        assert data["variationKey"] == "b"
+        assert data["runId"] == response.track_data["runId"]
+        assert SHADOW_FIELDS <= data.keys()
+
+        a_scores = [(n, d) for n, d in served if "judgeConfigKey" in d]
+        assert [n for n, _ in a_scores] == [metric_key]
+        assert not SHADOW_FIELDS & a_scores[0][1].keys()
+
+        deferred = await _deferred_run("success", metric_key)
+        assert [n for n, d in deferred if "judgeConfigKey" in d] == [sent]
+
+    @pytest.mark.parametrize("mode", ["background", "deferred"])
+    async def test_judge_call_events_are_shadow_events(self, mode: str) -> None:
+        if mode == "background":
+            served, shadow, response = await _background_run("success")
+        else:
+            served, shadow, response = [], await _deferred_run("success"), None
+        judge_call = [(n, d) for n, d in shadow if d.get("configKey") == "j"]
+        assert [n for n, _ in judge_call] == [
+            "$ld:ai-shadow:duration:total",
+            "$ld:ai-shadow:generation:success",
+            "$ld:ai-shadow:tokens:total",
+            "$ld:ai-shadow:tokens:input",
+            "$ld:ai-shadow:tokens:output",
+        ]
+        for _, data in judge_call:
+            assert data["isShadow"] is True
+            assert data["primaryVariationKey"] == "a"
+            assert data["shadowRequestId"] == "shadow-1"
+            assert data["ownerKind"] == "member"
+            assert data["ownerId"] == "member-1"
+            # The judge config's own track data, as on the served variation.
+            assert data["variationKey"] == "jv"
+            assert data["modelName"] == "judge-model"
+        if response is not None:
+            assert judge_call[0][1]["runId"] != response.track_data["runId"]
+
+        a_judge_call = [(n, d) for n, d in served if d.get("configKey") == "j"]
+        if mode == "background":
+            assert [n for n, _ in a_judge_call] == [
+                "$ld:ai:duration:total",
+                "$ld:ai:generation:success",
+                "$ld:ai:tokens:total",
+                "$ld:ai:tokens:input",
+                "$ld:ai:tokens:output",
+            ]
+            for _, data in a_judge_call:
+                assert not SHADOW_FIELDS & data.keys()
+
+    async def test_agui_stream_shadow_keys(self) -> None:
+        client = _use(_key_client())
+        instance = shadow_config(
+            key="flag",
+            handler=[
+                _Recorder("TestProvider", "real answer").handler,
+                _Recorder("ShadowProvider", "shadow answer").handler,
+                _Recorder("JudgeProvider", JUDGE_VERDICT).handler,
+            ],
+        )
+        async for _ in agui.stream(instance, "question", CONTEXT):
+            pass
+        served = len(client.track.call_args_list)
+        await sr._wait_for_shadows_for_testing()
+        calls = _calls(client)
+        shadow_keys = _keys(calls[served:])
+        assert shadow_keys
+        assert not [k for k in shadow_keys if k.startswith("$ld:ai:")]
+        assert "$ld:ai-shadow:judge-score" in shadow_keys
+        assert not [k for k in _keys(calls[:served]) if k.startswith("$ld:ai-shadow:")]
+
+    async def test_usage_events_keep_their_key(self) -> None:
+        served, shadow, _ = await _background_run("success")
+        assert ("$ld:ai:sdk:usage", "experimental.shadowConfig") in [
+            (n, d.get("helper")) for n, d in served
+        ]
+        lifecycle_module._reset_for_testing()
+        reset_sdk_usage()
+        events = await _deferred_run("success")
+        assert any(_is_run_shadow_usage(e) for e in events)
+        assert not [n for n, _ in shadow + events if ":sdk:" in n and "shadow" in n]
