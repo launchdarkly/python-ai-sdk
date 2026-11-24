@@ -19,6 +19,7 @@ from launchdarkly_ai_server import (
     LDContext,
     NativeGraphRunner,
     NativeTool,
+    _config_with_skill_tools,
     compose_history,
     get_client,
     make_track_data,
@@ -145,7 +146,9 @@ def to_litellm_agents(
                 kwargs["instructions"] = instructions
             if handoffs:
                 kwargs["handoffs"] = handoffs
-            node_tools = _tools(node.config, tool_handlers)
+            node_tools = _tools(
+                _config_with_skill_tools(node.key, node.config), tool_handlers
+            )
             if node_tools:
                 kwargs["tools"] = node_tools
             try:

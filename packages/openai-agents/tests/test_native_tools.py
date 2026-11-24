@@ -62,7 +62,9 @@ def test_native_graph_never_sends_a_native_tool(
 
     _assert_skipped(
         PREFIX + "native_graph",
-        lambda c, h: _build_node_tools(SimpleNamespace(config={"tools": c}), h),
+        lambda c, h: _build_node_tools(
+            SimpleNamespace(key="node", config={"tools": c}), h
+        ),
         lambda r: [t.name for t in r],
         caplog,
     )

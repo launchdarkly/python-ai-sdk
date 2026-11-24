@@ -22,6 +22,7 @@ from launchdarkly_ai_server import (
     LDContext,
     NativeGraphRunner,
     NativeTool,
+    _config_with_skill_tools,
     compose_history,
     get_client,
     is_function_tool,
@@ -159,11 +160,12 @@ def _build_node_tools(
     lc_tools = importlib.import_module("langchain_core.tools")
     tool_fn = lc_tools.tool
 
-    if not node.config.get("tools"):
+    config_tools = _config_with_skill_tools(node.key, node.config).get("tools")
+    if not config_tools:
         return []
 
     result = []
-    for name, tool_cfg in node.config["tools"].items():
+    for name, tool_cfg in config_tools.items():
         # Only a config tool with a function handler is offered: a missing handler or a
         # NativeTool never reaches the model.
         if not is_function_tool(tool_handlers.get(name), name):

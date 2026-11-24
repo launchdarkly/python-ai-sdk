@@ -138,7 +138,14 @@ _INTENT_TRANSFER_FULL = "xfer-full"
 _INTENT_TRANSFER_CHANGES = "xfer-changes"
 _INTENT_TRANSFER_NONE = "none"
 
-_ENVELOPE_FIELDS = ("contentType", "content", "contentHash", "name", "description")
+_ENVELOPE_FIELDS = (
+    "contentType",
+    "content",
+    "contentHash",
+    "name",
+    "description",
+    "tools",
+)
 """
 Envelope fields copied verbatim. Never coerced or defaulted: filling in a
 missing field would forge what verification checks.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect as _inspect
 import logging
 import re as _re
@@ -12,6 +13,7 @@ from typing import Any
 from .agui import StableProjector
 from .conversation import bind_conversation_id, bind_span_context
 from .registry import resolve_handlers, resolve_tools
+from .skills_core import _config_with_skill_tools
 from .types import (
     AiConfigRep,
     GraphDefinition,
@@ -177,10 +179,18 @@ async def _build_graph(
     nodes: dict[str, GraphNode] = {}
     # Raw variations, kept off the public GraphNode.
     node_values: dict[str, Any] = {}
+    # What each node runs with: its config plus its skills' tools, beside a copy of
+    # the config it was merged from. Kept off the public GraphNode, whose config is
+    # the variation's own, as native adapters expect.
+    node_run_configs: dict[str, tuple[AiConfigRep, AiConfigRep]] = {}
     try:
         for node_key in all_keys:
             variation = await extract_variation(node_key, context)
             node_config: AiConfigRep = variation["config"]
+            node_run_configs[node_key] = (
+                copy.deepcopy(node_config),
+                _config_with_skill_tools(node_key, node_config),
+            )
             node_meta: VariationMeta = variation["meta"]
             node_values[node_key] = variation.get("value")
             node_edges = edges_from(node_key)
@@ -227,6 +237,19 @@ async def _build_graph(
     # Runs a single node: calls the handler, runs per-node judges, and tracks
     # handoff events. Mirrors the TS GraphDefinition.runNode method.
 
+    def run_config(node: GraphNode) -> AiConfigRep:
+        # Reuse the build-time merge only while the node's config still matches
+        # what was merged: a caller may edit or replace GraphNode.config between
+        # resolve_graph and running the node, and the edit must take effect.
+        cached = node_run_configs.get(node.key)
+        if (
+            cached is not None
+            and nodes.get(node.key) is node
+            and node.config == cached[0]
+        ):
+            return cached[1]
+        return _config_with_skill_tools(node.key, node.config)
+
     async def run_node(
         node: GraphNode,
         input: str = "",
@@ -242,12 +265,14 @@ async def _build_graph(
         handler = select_handler(node.config, node.meta, handlers, strict=False)
         tool_handlers = opts.get("tool_handlers") or options.get("tool_handlers")
         from_node: GraphNode | None = opts.get("from")
+        # One merge per run, shared by the execution and its judges.
+        node_run_config = run_config(node)
 
         try:
             result = await execute_and_track(
                 config_key=node.key,
                 evaluated_value=node_values.get(node.key),
-                config=node.config,
+                config=node_run_config,
                 meta=node.meta,
                 user_context=context,
                 handler=handler,
@@ -264,7 +289,7 @@ async def _build_graph(
             )
 
             judge_results = await run_judges(
-                config=node.config,
+                config=node_run_config,
                 user_context=context,
                 handler=handler,
                 handlers=handlers,
@@ -361,8 +386,9 @@ async def _build_graph(
 
             handoff_handlers[tool_name] = _make_handoff_fn(target_key)
 
+        own_config = run_config(node)
         routed_config: AiConfigRep = {
-            **node.config,
+            **own_config,
             "instructions": (
                 (node.config.get("instructions") or "")
                 + (
@@ -374,13 +400,14 @@ async def _build_graph(
                 )
             ),
             "tools": {
-                **(node.config.get("tools") or {}),
+                **(own_config.get("tools") or {}),
                 **handoff_tools,
             },
         }
 
         return {
             "routed_config": routed_config,
+            "own_config": own_config,
             "handoff_handlers": handoff_handlers,
             "chosen": lambda: chosen[0] if chosen else None,
         }
@@ -441,9 +468,9 @@ async def _build_graph(
                 else str(result["response"])
             )
 
-            # Judge against the node's original config, not the routing-augmented one.
+            # Judge against the node's run config (skill tools included), not the handoff one.
             judge_results = await run_judges(
-                config=node.config,
+                config=routing["own_config"],
                 user_context=context,
                 handler=handler,
                 handlers=handlers,
@@ -514,6 +541,8 @@ async def _build_graph(
         handler = select_handler(node.config, node.meta, handlers, strict=False)
         tool_handlers = opts.get("tool_handlers") or options.get("tool_handlers")
         from_node: GraphNode | None = opts.get("from")
+        # One merge per run, shared by the execution and its judges.
+        node_run_config = run_config(node)
 
         yield {"type": "node_start", "nodeKey": node.key}
 
@@ -541,7 +570,7 @@ async def _build_graph(
             async for event in execute_and_stream(
                 config_key=node.key,
                 evaluated_value=node_values.get(node.key),
-                config=node.config,
+                config=node_run_config,
                 meta=node.meta,
                 user_context=context,
                 handler=handler,
@@ -564,7 +593,7 @@ async def _build_graph(
                 trajectory = projector.done.get("trajectory") or trajectory
 
             judge_results = await run_judges(
-                config=node.config,
+                config=node_run_config,
                 user_context=context,
                 handler=handler,
                 handlers=handlers,
@@ -708,9 +737,9 @@ async def _build_graph(
                 track_data = projector.done.get("track_data") or track_data
                 trajectory = projector.done.get("trajectory") or trajectory
 
-            # Judge against the node's original config, not the routing-augmented one.
+            # Judge against the node's run config (skill tools included), not the handoff one.
             judge_results = await run_judges(
-                config=node.config,
+                config=routing["own_config"],
                 user_context=context,
                 handler=handler,
                 handlers=handlers,

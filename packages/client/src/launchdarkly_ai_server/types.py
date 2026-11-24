@@ -583,6 +583,12 @@ class Skill:
     """Display name from LaunchDarkly metadata; never parsed from the content."""
     description: str | None = None
     """Description from LaunchDarkly metadata; never parsed from the content."""
+    tools: tuple[dict[str, Any], ...] = field(default=(), hash=False)
+    """
+    The tool definitions the skill pins, in author order; empty when it has none.
+    Each has the shape of an entry in a variation's ``config["tools"]``.
+    ``content_hash`` does not cover them, and ``write_skills`` never writes them.
+    """
 
 
 SkillOutcomeReason = Literal[

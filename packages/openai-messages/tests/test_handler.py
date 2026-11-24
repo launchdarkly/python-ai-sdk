@@ -3253,3 +3253,91 @@ class TestUnofferedToolsFailClosed:
                 pass
             sent = mock_openai.responses.stream.call_args.kwargs["tools"]
         assert [t["name"] for t in sent] == ["safe"]
+
+
+# ---------------------------------------------------------------------------
+# Skill tools (TESTING.md 3.21a)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_skill_tool_call_dispatches_and_is_tracked_like_any_tool(
+    mock_openai: MagicMock,
+) -> None:
+    """The model calls a tool only the attached skill pins: its ``tool_handlers``
+    entry runs, with an ``execute_tool`` span and a ``$ld:ai:tool_call`` event."""
+    import hashlib
+
+    import launchdarkly_ai_server.lifecycle as lifecycle_module
+    from launchdarkly_ai_openai_messages import create_openai_messages_handler
+    from launchdarkly_ai_server import InMemorySkillStore, config, set_skill_store
+
+    body = "---\nname: W\n---\nWeather.\n"
+    set_skill_store(
+        InMemorySkillStore(
+            {
+                "weather:1": {
+                    "key": "weather",
+                    "version": 1,
+                    "content": body,
+                    "contentHash": hashlib.sha256(body.encode()).hexdigest(),
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get-weather",
+                            "description": "Gets the weather.",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    ld = MagicMock()
+    ld.track = MagicMock()
+    ld.flush = AsyncMock()
+    ld.variation = AsyncMock(
+        return_value={
+            **CONFIG,
+            "skills": [{"key": "weather", "version": 1}],
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "v1",
+                "version": 1,
+                "mode": "messages",
+            },
+        }
+    )
+    lifecycle_module._set_client_for_testing(ld)
+    mock_openai.responses.create = AsyncMock(
+        side_effect=[
+            _make_response(tool_calls=[{"name": "get-weather", "call_id": "c1"}]),
+            _make_response(output_text="sunny"),
+        ]
+    )
+    weather = MagicMock(return_value="sunny")
+    ctx, rec = _recording()
+    try:
+        with ctx:
+            result = await config(
+                key="weather-agent",
+                handler=create_openai_messages_handler(),
+                tool_handlers={"get-weather": weather},
+            ).invoke("weather?", {"kind": "user", "key": "u1"})
+    finally:
+        # set_skill_store(None) is a no-op by design; clear the store itself.
+        from launchdarkly_ai_server.skills_core import clear_state
+
+        clear_state()
+        lifecycle_module._reset_for_testing()
+
+    assert result.response == "sunny"
+    offered = mock_openai.responses.create.call_args_list[0].kwargs["tools"]
+    assert [t["name"] for t in offered] == ["get-weather"]
+    weather.assert_called_once()
+    [span] = rec.named("execute_tool ")
+    assert span.name == "execute_tool get-weather"
+    tool_events = [
+        c for c in ld.track.call_args_list if c.args[0] == "$ld:ai:tool_call"
+    ]
+    assert len(tool_events) == 1
+    assert tool_events[0].args[2]["toolKey"] == "get-weather"

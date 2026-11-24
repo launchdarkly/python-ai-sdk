@@ -5,8 +5,10 @@ Tests for the native graph adapter (to_lang_graph) and LangChain-specific specs.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,7 +22,14 @@ from launchdarkly_ai_langchain_agents.native_graph import (
     _to_neutral_history,
     to_lang_graph,
 )
-from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, NativeTool
+from launchdarkly_ai_server import (
+    GraphDefinition,
+    GraphEdge,
+    GraphNode,
+    InMemorySkillStore,
+    NativeTool,
+    set_skill_store,
+)
 from tests.forwarding_spec import (
     LANGCHAIN_CHAT_OPENAI,
     candidate_keys,
@@ -1779,3 +1788,106 @@ class TestToolsFailClosed:
             }
         )
         assert self._offered(lambda: _build_node_tools(node, self.HANDLERS)) == ["safe"]
+
+
+_WEATHER_SKILL_BODY = "---\nname: W\n---\nWeather.\n"
+
+
+@pytest.fixture
+def weather_skill_store() -> Iterator[None]:
+    """A store holding skill ``weather`` v1, which pins the ``get-weather`` tool."""
+    set_skill_store(
+        InMemorySkillStore(
+            {
+                "weather:1": {
+                    "key": "weather",
+                    "version": 1,
+                    "content": _WEATHER_SKILL_BODY,
+                    "contentHash": hashlib.sha256(
+                        _WEATHER_SKILL_BODY.encode()
+                    ).hexdigest(),
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get-weather",
+                            "description": "d",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    try:
+        yield
+    finally:
+        # set_skill_store(None) is a no-op by design; clear the store itself.
+        from launchdarkly_ai_server.skills_core import clear_state
+
+        clear_state()
+
+
+@pytest.mark.asyncio
+async def test_native_graph_adapters_offer_a_nodes_skill_tools(
+    weather_skill_store: None,
+) -> None:
+    """TESTING.md §3.21a: the router attaches the weather skill and gets ``get-weather`` beside
+    its own tool and its handoff tool; the child does not attach it and does not get it."""
+    from langchain_core.messages import AIMessage
+
+    def _node(
+        key: str, tools: dict[str, Any], edges: list[str], **extra: Any
+    ) -> dict[str, Any]:
+        return {
+            "key": key,
+            "config": {
+                "model": {"name": "m"},
+                "provider": {"name": "OpenAI"},
+                "instructions": f"you are {key}",
+                "tools": tools,
+                **extra,
+            },
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [{"source_key": key, "target_key": c} for c in edges],
+            "is_terminal": not edges,
+        }
+
+    schema = {"description": "d", "parameters": {"type": "object", "properties": {}}}
+    graph_def = _make_graph_def(
+        nodes={
+            "router": _node(
+                "router",
+                {"lookup": schema},
+                ["child"],
+                skills=[{"key": "weather", "version": 1}],
+            ),
+            "child": _node("child", {"leaf-tool": schema}, []),
+        },
+        edges=[{"source_key": "router", "target_key": "child"}],
+        root_key="router",
+    )
+    factory, models = _scripted_models(
+        {
+            "router": [_tool_call_msg(("transfer_to_child", "call_1"))],
+            "child": [AIMessage(content="done")],
+        }
+    )
+    result, _ = await _run_handoff(
+        graph_def,
+        factory,
+        tool_handlers={
+            "get-weather": lambda a: "sunny",
+            "lookup": lambda a: "found",
+            "leaf-tool": lambda a: "leafed",
+        },
+    )
+
+    assert result["response"] == "done"
+
+    def _bound(key: str) -> list[str]:
+        return [t.name for t in models[key].bind_tools.call_args.args[0]]
+
+    # The router keeps its own tool, gains the skill's, and keeps its handoff to the child.
+    assert _bound("router") == ["lookup", "get-weather", "transfer_to_child"]
+    # The child does not attach the skill, so it is offered only its own tool.
+    assert _bound("child") == ["leaf-tool"]
