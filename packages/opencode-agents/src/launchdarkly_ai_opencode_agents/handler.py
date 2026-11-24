@@ -124,6 +124,7 @@ class _Reducer:
         capture_content: bool,
         session_id: str,
         config: AiConfigRep,
+        bedrock_request_model: str | None,
         parent: Any,
         open_tool_spans: dict[str, Any],
         open_model_spans: dict[str, Any],
@@ -134,6 +135,7 @@ class _Reducer:
         self._capture = capture_content
         self._session_id = session_id
         self._config = config
+        self._bedrock_request_model = bedrock_request_model
         self._parent = parent
         self._tool_spans = open_tool_spans
         self._model_spans = open_model_spans
@@ -495,7 +497,9 @@ class _Reducer:
                     and message_id not in self._closed_chat_ids
                 ):
                     self._model_spans[message_id] = start_model_span(
-                        self._config, self._parent
+                        self._config,
+                        self._parent,
+                        bedrock_request_model=self._bedrock_request_model,
                     )
                 # A reserved id is not an open AG-UI message. Only text that
                 # TurnEmitter has already yielded can take a parent or be split.
@@ -540,7 +544,13 @@ class _Reducer:
         span = self._model_spans.pop(message_id, None)
         if span is None:
             return
-        finish_model_span(span, self._config, _message_usage(tokens))
+        # OpenCode assistant modelID is selected before Bedrock inference.
+        finish_model_span(
+            span,
+            self._config,
+            _message_usage(tokens),
+            include_response_model=self._bedrock_request_model is None,
+        )
 
     def _add_usage(self, tokens: Mapping[str, Any]) -> None:
         self._saw_usage = True
@@ -894,7 +904,14 @@ class OpenCodeHandler(ProviderHandler):
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         capture = effective_capture_content(self._capture_content_override)
-        span = start_root_span(config, variables or {}, capture_content=capture)
+        provider_id, model_id = self._model(config if isinstance(config, dict) else {})
+        bedrock_request_model = model_id if provider_id == "amazon-bedrock" else None
+        span = start_root_span(
+            config,
+            variables or {},
+            capture_content=capture,
+            bedrock_request_model=bedrock_request_model,
+        )
         parent = parent_context_of(span)
         ended: set[int] = set()
         open_tool_spans: dict[str, Any] = {}
@@ -904,7 +921,6 @@ class OpenCodeHandler(ProviderHandler):
         # does not see it, so the finally would otherwise stamp
         # launchdarkly.stream.abandoned. cancelled wins in end_span_once.
         cancelled = False
-        provider_id, model_id = self._model(config if isinstance(config, dict) else {})
         system = _system_text(config, variables)
         prompt = _user_prompt(config, user_input, history, variables)
         plan = _plan_tools(config, tool_handlers)
@@ -995,6 +1011,7 @@ class OpenCodeHandler(ProviderHandler):
                 span,
                 config,
                 add_cached_tokens_to_input(usage) if usage is not None else SpanUsage(),
+                include_response_model=bedrock_request_model is None,
             )
             mark_ok(span)
             done: dict[str, Any] = {"type": "done", "output": output}
@@ -1074,7 +1091,7 @@ async def _reduce_session(
     tool_display_names: Mapping[str, str],
     tool_native_stubs: Mapping[str, Callable[[], None]],
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Reduce the session ``POST /session`` created. The reducer is unchanged."""
+    """Reduce events from the session created by ``POST /session``."""
     session_ids: list[str] = []
     reducer: _Reducer | None = None
     async with aclosing(
@@ -1097,6 +1114,9 @@ async def _reduce_session(
                     capture_content=capture,
                     session_id=session_ids[0],
                     config=config,
+                    bedrock_request_model=model_id
+                    if provider_id == "amazon-bedrock"
+                    else None,
                     parent=parent,
                     open_tool_spans=open_tool_spans,
                     open_model_spans=open_model_spans,

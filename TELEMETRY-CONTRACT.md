@@ -155,6 +155,11 @@ response, and one other reports a real per-turn model. Copy this table exactly.
 So four of the six handlers write the requested name everywhere, and section 3's table must be
 read through this one.
 
+For OpenCode's managed Bedrock route, `invoke_agent` and `chat` use the resolved OpenCode
+request ID, which can include the inference profile prefix. OpenCode assigns the assistant's
+`modelID` from its selected model before inference. Bedrock Converse does not expose a standard
+executed model field, so these spans omit `gen_ai.response.model`.
+
 ### `gen_ai.request.model` has one exception too
 
 Five handlers write the requested name, which is what the caller asked for.
