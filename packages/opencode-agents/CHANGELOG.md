@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-opencode-agents-1.0.1...launchdarkly-ai-opencode-agents-1.0.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **opencode-agents:** capture tool failure details in spans ([#316](https://github.com/launchdarkly/python-ai-sdk/issues/316)) ([82f38ec](https://github.com/launchdarkly/python-ai-sdk/commit/82f38ecf6b7cf763912423b4c54e880ddcbefc8e))
+* **opencode-agents:** report the resolved Bedrock request model ([#322](https://github.com/launchdarkly/python-ai-sdk/issues/322)) ([4fbd542](https://github.com/launchdarkly/python-ai-sdk/commit/4fbd542f332cbe095ce9a793595f9c4bee397217))
+* write aws.bedrock as the Bedrock provider name in the Vercel, LiteLLM and OpenCode handlers ([#298](https://github.com/launchdarkly/python-ai-sdk/issues/298)) ([623e159](https://github.com/launchdarkly/python-ai-sdk/commit/623e15956a48c87fa14d575605623b2171d64a1a))
+
 ## [1.0.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-opencode-agents-1.0.0...launchdarkly-ai-opencode-agents-1.0.1) (2026-11-12)
 
 

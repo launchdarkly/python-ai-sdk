@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-1.0.1...launchdarkly-ai-langchain-agents-1.0.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **langchain:** write aws.bedrock as the Bedrock provider name ([#297](https://github.com/launchdarkly/python-ai-sdk/issues/297)) ([f5a9852](https://github.com/launchdarkly/python-ai-sdk/commit/f5a98523ec0c44a5231e8d896e2d6b08039ddc9c))
+
 ## [1.0.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-1.0.0...launchdarkly-ai-langchain-agents-1.0.1) (2026-11-12)
 
 
