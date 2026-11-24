@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -270,6 +271,47 @@ def _rebuild_anthropic_output_config(kwargs: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+def _rebuild_gemini_parameters(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Applies the Gemini table's value rules to forwarded ``ChatGoogleGenerativeAI`` kwargs.
+
+    ``thinking_level`` is kept only when it is one of :data:`_GEMINI_THINKING_LEVELS`, ignoring
+    case, and is sent in lower case. ``thinking_budget`` is kept only as a whole number, and is
+    dropped when a ``thinking_level`` is kept, since the Gemini API rejects a request that sets
+    both. ``media_resolution`` is kept only when it is one of :data:`_GEMINI_MEDIA_RESOLUTIONS`,
+    ignoring case, and is sent in upper case.
+    """
+    level = kwargs.pop("thinking_level", None)
+    if isinstance(level, str) and level.lower() in _GEMINI_THINKING_LEVELS:
+        kwargs["thinking_level"] = level.lower()
+        kwargs.pop("thinking_budget", None)
+    if "thinking_budget" in kwargs:
+        budget = kwargs["thinking_budget"]
+        if isinstance(budget, bool) or not isinstance(budget, int):
+            del kwargs["thinking_budget"]
+    resolution = kwargs.pop("media_resolution", None)
+    if isinstance(resolution, str) and resolution.upper() in _GEMINI_MEDIA_RESOLUTIONS:
+        kwargs["media_resolution"] = resolution.upper()
+    return kwargs
+
+
+def _gemini_api_key_kwargs() -> dict[str, Any]:
+    """The Gemini API key, read from the environment only, never from ``model.parameters``.
+
+    ``GOOGLE_API_KEY`` is used when it is set and not empty, and ``ChatGoogleGenerativeAI`` reads
+    it itself. Otherwise ``GEMINI_API_KEY`` is passed to the class explicitly: the class falls back
+    to it only when ``GOOGLE_API_KEY`` is absent, and takes an empty ``GOOGLE_API_KEY`` over it.
+    With neither set the run fails here, before any request is sent.
+    """
+    if os.environ.get("GOOGLE_API_KEY"):
+        return {}
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_key:
+        return {"google_api_key": gemini_key}
+    raise ValueError(
+        "Using Gemini models requires an API key. Set GOOGLE_API_KEY or GEMINI_API_KEY."
+    )
+
+
 #: Accepted by ``ChatAnthropic`` but never forwarded, and why:
 #: * ``anthropic_api_key``, ``api_key``: credentials (field plus alias).
 #: * ``anthropic_api_url``, ``base_url``, ``anthropic_proxy``: where requests go.
@@ -399,12 +441,12 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: ``TestChatGoogleGenerativeAIAcceptsExactlyTheseKeys`` in this package's tests skips itself when
 #: it is not installed rather than asserting nothing.
 #:
-#: The cross-SDK list has no ChatGoogleGenerativeAI entry yet, so this list is the proposed one,
-#: and ``LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI`` in the shared test spec holds the same keys. Three
-#: of its fields take a second spelling, and each alias is renamed to the field before this list applies, with the field
-#: winning when the config also set it (see :data:`_CHAT_GOOGLE_GENERATIVE_AI_RENAMES`):
-#: ``max_tokens`` becomes ``max_output_tokens``, ``stop_sequences`` becomes ``stop``, and
-#: ``thinking_level`` (Gemini's own name) becomes ``reasoning_effort``.
+#: This is the Gemini table in the cross-SDK contract, and ``LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI``
+#: in the shared test spec holds the same keys. Two keys are another spelling of a table key and are
+#: renamed before this list applies, with the table key winning when the config also set it (see
+#: :data:`_CHAT_GOOGLE_GENERATIVE_AI_RENAMES`): ``max_tokens`` becomes ``max_output_tokens`` and
+#: ``stop`` becomes ``stop_sequences``. ``thinking_level``, ``thinking_budget`` and
+#: ``media_resolution`` are then checked by :func:`_rebuild_gemini_parameters`.
 _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -412,7 +454,6 @@ _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS = frozenset(
         "max_tokens",
         "media_resolution",
         "presence_penalty",
-        "reasoning_effort",
         "seed",
         "stop",
         "stop_sequences",
@@ -424,13 +465,25 @@ _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS = frozenset(
     }
 )
 
-#: Alias to the name it is renamed to before forwarding. ``ChatGoogleGenerativeAI`` takes both
-#: spellings of each field, so passing both would leave which one wins to pydantic.
+#: Other spelling to the table key it is renamed to before forwarding. Each pair is the field and
+#: alias of one ``ChatGoogleGenerativeAI`` field, so passing both would leave which one wins to
+#: pydantic. ``stop_sequences`` wins over ``stop`` here, as on every other route.
 _CHAT_GOOGLE_GENERATIVE_AI_RENAMES = {
     "max_tokens": "max_output_tokens",
-    "stop_sequences": "stop",
-    "thinking_level": "reasoning_effort",
+    "stop": "stop_sequences",
 }
+
+#: The ``thinking_level`` values Gemini takes, compared ignoring case and sent in lower case,
+#: which is the spelling of ``reasoning_effort``, the Python class's field for it.
+_GEMINI_THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+
+#: The ``media_resolution`` values Gemini takes, compared ignoring case and sent in upper case.
+_GEMINI_MEDIA_RESOLUTIONS = frozenset(
+    {"MEDIA_RESOLUTION_LOW", "MEDIA_RESOLUTION_MEDIUM", "MEDIA_RESOLUTION_HIGH"}
+)
+
+#: The model a Gemini config with an empty ``model.name`` runs on, in every SDK.
+_GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 
 #: Accepted by ``ChatGoogleGenerativeAI`` but never forwarded, and why:
 #: * ``google_api_key``, ``api_key``, ``credentials``: credentials (field plus alias, and the
@@ -451,9 +504,11 @@ _CHAT_GOOGLE_GENERATIVE_AI_RENAMES = {
 #:   output, which the handler does not read.
 #: * ``n``, ``candidate_count``: response shape. The handler reads one reply, so extra candidates
 #:   are billed output the handler never returns.
+#: * ``reasoning_effort``: the Python field behind ``thinking_level``. The cross-SDK table names
+#:   only ``thinking_level``, which is forwarded under its own name, so the field name is dropped.
 #: * ``include_thoughts``, ``thinking_config``: response shape. ``include_thoughts`` puts the
 #:   model's thought summaries into the reply content the handler returns, and ``thinking_config``
-#:   is the raw form that can carry it. The flat ``thinking_budget`` and ``reasoning_effort`` above
+#:   is the raw form that can carry it. The flat ``thinking_budget`` and ``thinking_level`` above
 #:   cover the model settings it holds.
 #: * ``convert_system_message_to_human``: runtime wiring. It changes how the handler's own messages
 #:   are mapped onto the request.
@@ -489,6 +544,7 @@ _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "image_config",
     "n",
     "candidate_count",
+    "reasoning_effort",
     "include_thoughts",
     "thinking_config",
     "convert_system_message_to_human",
@@ -781,17 +837,20 @@ def _make_default_chat_model(
                 'Install it with: pip install "launchdarkly-ai-langchain-messages[google]"'
             ) from exc
         return lc_google.ChatGoogleGenerativeAI(
-            **_model_constructor_kwargs(
-                config,
-                "",
-                _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS,
-                renames=_CHAT_GOOGLE_GENERATIVE_AI_RENAMES,
-                # ChatGoogleGenerativeAI's max_retries is the genai client's total attempt count,
-                # first request included, and it reads 0 as "use the Google default". One more
-                # than the retry count keeps max_retries=0 meaning no retries, as it does for the
-                # other classes.
-                max_retries=None if max_retries is None else max_retries + 1,
-            )
+            **_rebuild_gemini_parameters(
+                _model_constructor_kwargs(
+                    config,
+                    _GEMINI_DEFAULT_MODEL,
+                    _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS,
+                    renames=_CHAT_GOOGLE_GENERATIVE_AI_RENAMES,
+                    # ChatGoogleGenerativeAI's max_retries is the genai client's total attempt
+                    # count, first request included, and it reads 0 as "use the Google default".
+                    # One more than the retry count keeps max_retries=0 meaning no retries, as it
+                    # does for the other classes.
+                    max_retries=None if max_retries is None else max_retries + 1,
+                )
+            ),
+            **_gemini_api_key_kwargs(),
         )
     lc_openai = importlib.import_module("langchain_openai")
     return lc_openai.ChatOpenAI(
@@ -1299,6 +1358,29 @@ def _create_langchain_messages_handler(
     )
 
 
+def _rebuilt_turn_content(gathered: Any, accumulated_content: str) -> Any:
+    """The content of an assistant turn rebuilt from streamed chunks.
+
+    Text blocks that carry provider metadata, such as the thought signature
+    ``langchain-google-genai`` keeps in a text block's ``extras``, stay as blocks so the next turn
+    sends the metadata back. Otherwise the turn is the accumulated text.
+    """
+    blocks = getattr(gathered, "content", None)
+    if not isinstance(blocks, list):
+        return accumulated_content
+    text_blocks = [
+        block
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    if not any(block.get("extras") for block in text_blocks):
+        return accumulated_content
+    return [
+        {key: value for key, value in block.items() if key != "index"}
+        for block in text_blocks
+    ]
+
+
 async def _stream_gen(
     llm: Any,
     config: AiConfigRep,
@@ -1331,8 +1413,6 @@ async def _stream_gen(
     """
     import importlib
 
-    base_model = await _resolve_base_model(config, llm, importlib, max_retries)
-
     span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
@@ -1341,7 +1421,6 @@ async def _stream_gen(
     tool_defs = _build_tools(config.get("tools") or {}, tool_handlers or {})
     # A tool name in a model response is untrusted: resolve it only against what was offered.
     offered = {tool["function"]["name"] for tool in tool_defs}
-    tool_model = base_model.bind_tools(tool_defs) if tool_defs else base_model
     tool_definitions = to_tool_definitions(tool_defs)
     conversation_messages = list(initial_messages)
     full_output: Any = ""
@@ -1378,6 +1457,10 @@ async def _stream_gen(
                 system_instructions=system_instructions,
                 messages=span_messages,
             )
+        # Inside the guard too, so a missing optional package or Gemini API key fails the run and
+        # ends the root with ERROR instead of raising before the root exists.
+        base_model = await _resolve_base_model(config, llm, importlib, max_retries)
+        tool_model = base_model.bind_tools(tool_defs) if tool_defs else base_model
         while True:
             model_span = start_model_span(config, parent)
             open_model_span = model_span
@@ -1563,9 +1646,10 @@ async def _stream_gen(
             for rich in emitter.end_text():
                 yield rich
             # Keep the gathered chunk's metadata. langchain-google-genai holds each function call's
-            # thought signature in additional_kwargs, and Gemini 3 rejects the next turn without it.
+            # thought signature in additional_kwargs, and a text part's in its content block, and
+            # Gemini 3 rejects the next turn without them.
             assistant_msg = AIMessage(
-                content=accumulated_content,
+                content=_rebuilt_turn_content(gathered, accumulated_content),
                 tool_calls=accumulated_tool_calls,
                 additional_kwargs=dict(
                     getattr(gathered, "additional_kwargs", None) or {}

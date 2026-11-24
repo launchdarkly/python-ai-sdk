@@ -210,17 +210,18 @@ class TestChatGoogleGenerativeAIAcceptsExactlyTheseKeys:
             "ChatGoogleGenerativeAI does not accept them"
         )
 
-    def test_every_alias_is_renamed_to_its_field(self) -> None:
-        """Each rename maps a pydantic alias onto the field it belongs to, so a config that sets
-        both spellings reaches the class under one name."""
+    def test_every_rename_joins_two_spellings_of_one_field(self) -> None:
+        """Each rename maps one spelling of a ``ChatGoogleGenerativeAI`` field onto its other
+        spelling, the table key, so a config that sets both reaches the class under one name."""
         lc_google = pytest.importorskip("langchain_google_genai")
         fields = lc_google.ChatGoogleGenerativeAI.model_fields
-        aliases = {
-            field.alias: name
+        spellings = {
+            frozenset({name, field.alias})
             for name, field in fields.items()
-            if name in _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS and field.alias
+            if field.alias and field.alias != name
         }
-        assert aliases == dict(_CHAT_GOOGLE_GENERATIVE_AI_RENAMES)
+        for other, key in _CHAT_GOOGLE_GENERATIVE_AI_RENAMES.items():
+            assert frozenset({other, key}) in spellings, (other, key)
 
 
 class TestModelFieldAliasesAreNeverForwarded:
@@ -656,36 +657,112 @@ def test_reasoning_effort_keeps_chat_openai_on_chat_completions() -> None:
 
 
 class TestGeminiAliasRenames:
-    """``ChatGoogleGenerativeAI`` takes ``max_tokens``, ``stop_sequences`` and ``thinking_level`` as
-    aliases of ``max_output_tokens``, ``stop`` and ``reasoning_effort``. Each alias is renamed
-    before forwarding, and the field wins when both are set."""
+    """``max_tokens`` and ``stop`` are other spellings of the Gemini table keys ``max_output_tokens``
+    and ``stop_sequences``. Each is renamed before forwarding, and the table key wins when both are
+    set, as on every other route."""
 
     @pytest.mark.parametrize(
-        ("alias", "field", "alias_value", "field_value"),
+        ("other", "key", "other_value", "key_value"),
         [
             ("max_tokens", "max_output_tokens", 300, 200),
-            ("stop_sequences", "stop", ["A"], ["B"]),
-            ("thinking_level", "reasoning_effort", "high", "low"),
+            ("stop", "stop_sequences", ["A"], ["B"]),
         ],
     )
-    def test_alias_becomes_the_field_and_the_field_wins(
-        self, alias: str, field: str, alias_value: Any, field_value: Any
+    def test_the_other_spelling_becomes_the_key_and_the_key_wins(
+        self, other: str, key: str, other_value: Any, key_value: Any
     ) -> None:
-        assert _build("gemini", {alias: alias_value}) == {
+        assert _build("gemini", {other: other_value}) == {
             "model": "configured-model",
-            field: alias_value,
+            key: other_value,
         }
-        assert _build("gemini", {alias: alias_value, field: field_value}) == {
+        assert _build("gemini", {other: other_value, key: key_value}) == {
             "model": "configured-model",
-            field: field_value,
+            key: key_value,
         }
 
-    def test_the_real_class_accepts_the_forwarded_kwargs(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_the_real_class_accepts_the_forwarded_kwargs(self) -> None:
         lc_google = pytest.importorskip("langchain_google_genai")
-        monkeypatch.setenv("GOOGLE_API_KEY", "test-not-a-real-key")
         for key in sorted(LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI):
             kwargs = _build("gemini", {key: sample(key)})
             kwargs["model"] = "gemini-3.1-pro-preview"
             lc_google.ChatGoogleGenerativeAI(**kwargs)
+
+
+class TestGeminiValueRules:
+    """The value rules in the Gemini table: the thinking keys, ``media_resolution`` and the
+    Python field name ``reasoning_effort``."""
+
+    @pytest.mark.parametrize("level", ["low", "LOW", "Medium", "minimal", "xhigh"])
+    def test_thinking_level_is_kept_in_lower_case(self, level: str) -> None:
+        assert _build("gemini", {"thinking_level": level}) == {
+            "model": "configured-model",
+            "thinking_level": level.lower(),
+        }
+
+    @pytest.mark.parametrize("level", ["max", "", 2, None, {"level": "low"}])
+    def test_an_unknown_thinking_level_is_dropped(self, level: Any) -> None:
+        assert _build("gemini", {"thinking_level": level}) == {
+            "model": "configured-model"
+        }
+
+    @pytest.mark.parametrize("budget", [-1, 0, 2048])
+    def test_a_whole_number_thinking_budget_is_kept(self, budget: int) -> None:
+        assert _build("gemini", {"thinking_budget": budget}) == {
+            "model": "configured-model",
+            "thinking_budget": budget,
+        }
+
+    @pytest.mark.parametrize("budget", [1.5, "2048", True, None])
+    def test_any_other_thinking_budget_is_dropped(self, budget: Any) -> None:
+        assert _build("gemini", {"thinking_budget": budget}) == {
+            "model": "configured-model"
+        }
+
+    def test_thinking_level_wins_over_thinking_budget(self) -> None:
+        assert _build(
+            "gemini", {"thinking_level": "HIGH", "thinking_budget": 2048}
+        ) == {
+            "model": "configured-model",
+            "thinking_level": "high",
+        }
+
+    def test_an_unknown_thinking_level_leaves_the_budget(self) -> None:
+        assert _build("gemini", {"thinking_level": "max", "thinking_budget": 2048}) == {
+            "model": "configured-model",
+            "thinking_budget": 2048,
+        }
+
+    @pytest.mark.parametrize(
+        "resolution",
+        ["MEDIA_RESOLUTION_LOW", "media_resolution_medium", "Media_Resolution_High"],
+    )
+    def test_media_resolution_is_kept_in_upper_case(self, resolution: str) -> None:
+        assert _build("gemini", {"media_resolution": resolution}) == {
+            "model": "configured-model",
+            "media_resolution": resolution.upper(),
+        }
+
+    @pytest.mark.parametrize(
+        "resolution", ["MEDIA_RESOLUTION_ULTRA", "low", "", 1, None]
+    )
+    def test_any_other_media_resolution_is_dropped(self, resolution: Any) -> None:
+        assert _build("gemini", {"media_resolution": resolution}) == {
+            "model": "configured-model"
+        }
+
+    def test_reasoning_effort_is_not_read(self) -> None:
+        assert _build("gemini", {"reasoning_effort": "low"}) == {
+            "model": "configured-model"
+        }
+
+    def test_the_real_class_takes_the_rebuilt_values(self) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        kwargs = _build(
+            "gemini",
+            {"thinking_level": "LOW", "media_resolution": "media_resolution_high"},
+        )
+        kwargs["model"] = "gemini-3.1-pro-preview"
+        model = lc_google.ChatGoogleGenerativeAI(**kwargs)
+        assert model.reasoning_effort == "low"
+        assert model.media_resolution is not None
+        assert model.media_resolution.value == "MEDIA_RESOLUTION_HIGH"

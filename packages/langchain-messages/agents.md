@@ -31,7 +31,7 @@ The handler is model-agnostic — it accepts any `BaseChatModel`. With no `llm`,
 | `gemini` | `ChatGoogleGenerativeAI` | `pip install "launchdarkly-ai-langchain-messages[google]"` |
 | anything else | `ChatOpenAI` | included |
 
-A missing integration package raises `ImportError` naming the extra to install. `ChatGoogleGenerativeAI` uses the Gemini Developer API and reads its key from `GOOGLE_API_KEY`, falling back to `GEMINI_API_KEY`. Gemini 3 needs each function call's thought signature sent back on the next turn; the handler keeps the model's `additional_kwargs` on the assistant turn it replays, which is where `langchain-google-genai` stores them.
+A missing integration package raises `ImportError` naming the extra to install, and the run ends with the root span in ERROR on both `invoke` and `stream`. `ChatGoogleGenerativeAI` uses the Gemini Developer API with its key from the environment only: `GOOGLE_API_KEY`, or `GEMINI_API_KEY` when `GOOGLE_API_KEY` is unset or empty. With neither set, the run fails with a `ValueError` naming both before any request. An empty `model.name` runs on `gemini-2.5-flash`. Gemini 3 needs each thought signature sent back on the next turn; the streaming tool loop keeps the model's `additional_kwargs` (function-call signatures) and its signed text blocks (text-part signatures) on the assistant turn it rebuilds, which is where `langchain-google-genai` stores them.
 
 ---
 

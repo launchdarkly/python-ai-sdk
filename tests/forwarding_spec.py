@@ -192,7 +192,6 @@ LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI = frozenset(
         "max_tokens",
         "media_resolution",
         "presence_penalty",
-        "reasoning_effort",
         "seed",
         "stop",
         "stop_sequences",

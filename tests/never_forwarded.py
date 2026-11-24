@@ -21,6 +21,7 @@ NEVER_FORWARDED_KEYS = frozenset(
         "anthropic_api_key",
         "bedrock_api_key",
         "google_api_key",
+        "googleApiKey",
         "credentials",
         "credentials_profile_name",
         "auth_token",
