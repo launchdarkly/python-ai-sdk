@@ -54,14 +54,21 @@ def provider_name(config: AiConfigRep) -> str:
 
 
 def start_root_span(
-    config: AiConfigRep, variables: dict[str, Any], *, capture_content: bool = False
+    config: AiConfigRep,
+    variables: dict[str, Any],
+    *,
+    capture_content: bool = False,
+    bedrock_request_model: str | None = None,
 ) -> Any:
     """Opens the ``invoke_agent`` root and returns it, or ``None`` when OTel is absent."""
     if not _HAS_OTEL:
         return None
     span = trace.get_tracer(TRACER_NAME).start_span("invoke_agent")
     span.set_attribute("gen_ai.operation.name", "invoke_agent")
-    set_model_identity_attributes(span, provider_name(config), model_name(config))
+    if bedrock_request_model is None:
+        set_model_identity_attributes(span, provider_name(config), model_name(config))
+    else:
+        set_model_identity_attributes(span, "aws.bedrock", bedrock_request_model)
     set_ld_span_attributes(span, variables, capture_content=capture_content)
     return span
 
@@ -73,14 +80,19 @@ def parent_context_of(span: Any) -> Any:
     return trace.set_span_in_context(span)
 
 
-def start_model_span(config: AiConfigRep, parent: Any) -> Any:
+def start_model_span(
+    config: AiConfigRep, parent: Any, *, bedrock_request_model: str | None = None
+) -> Any:
     """Opens one ``chat {model}`` span for one model turn."""
     if not _HAS_OTEL:
         return None
-    name = model_name(config)
+    name = (
+        model_name(config) if bedrock_request_model is None else bedrock_request_model
+    )
+    provider = provider_name(config) if bedrock_request_model is None else "aws.bedrock"
     span = trace.get_tracer(TRACER_NAME).start_span(f"chat {name}", context=parent)
     span.set_attribute("gen_ai.operation.name", "chat")
-    set_model_identity_attributes(span, provider_name(config), name)
+    set_model_identity_attributes(span, provider, name)
     return span
 
 
@@ -97,24 +109,26 @@ def start_tool_span(tool_name: str, tool_call_id: str, parent: Any) -> Any:
     return span
 
 
-def finish_root_span(span: Any, config: AiConfigRep, usage: SpanUsage) -> None:
-    """Writes the requested model and token totals onto the root. Does not end it."""
+def finish_root_span(span: Any, response_model: str | None, usage: SpanUsage) -> None:
+    """Writes model metadata and token totals onto the root. Does not end it."""
     if span is None:
         return
-    span.set_attribute("gen_ai.response.model", model_name(config))
+    if response_model is not None:
+        span.set_attribute("gen_ai.response.model", response_model)
     set_usage_span_attributes(span, usage)
 
 
 def finish_model_span(
     span: Any,
-    config: AiConfigRep,
+    response_model: str | None,
     usage: SpanUsage,
     finish_reason: str | None = None,
 ) -> None:
     """Ends one ``chat`` span successfully."""
     if span is None:
         return
-    span.set_attribute("gen_ai.response.model", model_name(config))
+    if response_model is not None:
+        span.set_attribute("gen_ai.response.model", response_model)
     if finish_reason:
         span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
     set_usage_span_attributes(span, usage)

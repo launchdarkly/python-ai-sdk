@@ -976,6 +976,56 @@ async def test_failed_tool_span_without_error_detail(
     }
 
 
+@pytest.mark.parametrize("custom_resolver", [False, True])
+async def test_bedrock_model_spans_match_posted_request(
+    monkeypatch: pytest.MonkeyPatch, custom_resolver: bool
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from launchdarkly_ai_opencode_agents import spans as span_module
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(span_module.trace, "get_tracer", provider.get_tracer)
+    model_id = (
+        "global.anthropic.claude-example"
+        if custom_resolver
+        else "us.anthropic.claude-example"
+    )
+    completion = assistant_completed("m1")
+    completion["properties"]["info"]["modelID"] = model_id
+    options = (
+        {"model": lambda _: ("amazon-bedrock", model_id)} if custom_resolver else {}
+    )
+    handler, script = playing([assistant_open("m1"), completion], **options)
+    try:
+        await handler(
+            {
+                "instructions": "Be brief.",
+                "model": {"name": "anthropic.claude-example", "region": "us"},
+                "provider": {"name": "Bedrock"},
+            },
+            "hi",
+        )
+        spans = exporter.get_finished_spans()
+    finally:
+        provider.shutdown()
+
+    assert script.messages[0]["model"] == {
+        "providerID": "amazon-bedrock",
+        "modelID": model_id,
+    }
+    assert {span.name for span in spans} == {"invoke_agent", f"chat {model_id}"}
+    for span in spans:
+        assert span.attributes["gen_ai.request.model"] == model_id
+        assert "gen_ai.response.model" not in span.attributes
+
+
 @pytest.mark.parametrize("capture_content", [False, True])
 async def test_completed_tool_span(
     monkeypatch: pytest.MonkeyPatch, capture_content: bool
