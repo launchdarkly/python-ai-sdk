@@ -74,6 +74,87 @@ them mypy-clean under `strict` is a separate piece of work.
 The `UP046` rule (PEP 695 `type` statement syntax for generic classes) is **ignored** in `pyproject.toml`. Do not convert `class Foo(Generic[T]):` to PEP 695 syntax — it is a deliberate migration decision.
 
 
+## Language idioms
+
+The public contract is shared with the JavaScript and Go SDKs. Everything else is
+written the way a Python developer expects: see [PEP 8](https://peps.python.org/pep-0008/),
+[PEP 484](https://peps.python.org/pep-0484/) and the [typing docs](https://typing.python.org/).
+The Ruff and mypy settings in `pyproject.toml` are the enforced subset. Do not port
+another SDK's shape into Python. If the contract and an idiom conflict, the contract
+wins: raise the conflict.
+
+### What never varies
+Public behaviour, defaults, telemetry (span names, attributes, events), wire
+payloads, usage IDs and error *conditions* (what fails, and before or after which
+I/O). A name is the contract's name in snake_case (`initEvaluations` →
+`init_evaluations`). Types keep PascalCase.
+
+### Errors
+A public call raises; it never returns a `(value, error)` pair. A bad argument
+raises `ValueError` or `TypeError`, or the feature's exception when it has one.
+A feature whose callers need to catch its failures defines one public exception
+for them (`EvaluationsError`, `OpenCodeSessionError`, `TypesafeQuestionError`),
+subclassing `Exception` or the closest built-in. Inside `except`, chain with `from exc` to keep the cause. A
+result type that carries an error field is used only where the contract defines
+one (`ParseFailure`, `ReconcileAction.error`). Catch an exception only to handle
+it, to wrap it, to return a fallback the contract defines (`inspect_config`), or
+to keep an optional step (telemetry, usage reporting, cleanup in `shutdown`) from
+failing the call.
+
+### Layout
+Public names are exported from the package root through `__init__.py` and listed
+in `__all__`. A feature may be a subpackage (`evaluations/`) that the root
+re-exports. Experimental features are submodules of
+`launchdarkly_ai_server.experimental` (`experimental.shadow_requests`), never
+re-exported from the root. The public modules are the ones with an API report;
+other modules are internal, and helpers inside a public module have a leading
+underscore.
+A public module's `__all__` lists nothing that is not supported API.
+
+### Naming
+PEP 8: `snake_case` functions, methods and keyword arguments; `PascalCase` classes;
+`UPPER_CASE` constants. A closed string set in the public API is a
+`Literal[...]`, and the runtime check still stays for untyped callers.
+
+### Concurrency
+I/O-bound public calls are `async def` when the feature is async in the contract.
+No blocking I/O inside a coroutine; move it off the loop with `asyncio.to_thread`,
+or a thread of its own when the call can block for long (`init_client`).
+Use `async with` / `try`/`finally` for cleanup, and close async generators on early
+exit.
+
+### Options
+New optional settings are keyword-only parameters (`*,`) with defaults. A mapping
+of settings passed through to a provider is a `TypedDict(total=False)` (the
+`*NativeGraphOptions` types), not a bare `dict`. Durations are seconds as `float`,
+unless the contract or a wrapped library fixes a unit (`force_flush(timeout_millis=...)`
+follows OpenTelemetry). Config and value types are `@dataclass(frozen=True)`
+(`AIConfig`, `EvalTool`, `SDKOptions`, `Skill`); changing one means
+`dataclasses.replace`. A result type is frozen when the contract makes it
+immutable (`ReconcileReport`), otherwise a plain `@dataclass` (`EvalRunResult`,
+`JudgeResult`).
+
+### Testing
+`pytest`, under `packages/<package>/tests/`; tests that span packages (API report,
+cross-handler parity, packaging) live in the root `tests/`. Use fakes. No test
+touches the external network or a LaunchDarkly endpoint; a fake server binds to
+loopback and is closed in teardown. mypy `strict` covers
+`packages/*/src` (`make typecheck`). The API report test fails when a public
+signature changes.
+
+### Docs
+A docstring on every public class, function and method you add or change. Reuse
+the other SDKs' wording for the same concept.
+
+### Dependencies
+The core package keeps runtime dependencies to a minimum. A provider SDK is a
+dependency only of the handler packages that call it (`openai` for the OpenAI and
+LiteLLM agents handlers), never of `launchdarkly-ai-server`. Avoid a dependency
+unless it is widely used, maintained, and does something well specified.
+
+### References
+`make lint`, `make format-check`, `make typecheck`, `make test`, `make api-report-check`.
+
 ## Public API Reports
 
 Every public module has a committed API report at `packages/<package>/api-report/<module>.txt`: each name in its `__all__`, one per line, with its full signature, and a class's public members indented below it. The reports are the public API contract.
