@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-1.1.0...launchdarkly-ai-server-1.2.0) (2026-11-24)
+
+
+### Experimental
+
+* **shadow-requests:** run judges on shadow responses ([#302](https://github.com/launchdarkly/python-ai-sdk/issues/302)) ([1f74489](https://github.com/launchdarkly/python-ai-sdk/commit/1f744897defbc308b3a5941facf3543880cca259))
+
+
+### Features
+
+* **evaluations:** reconcile offline evaluations by key ([#277](https://github.com/launchdarkly/python-ai-sdk/issues/277)) ([6226f7b](https://github.com/launchdarkly/python-ai-sdk/commit/6226f7bb76d6f424e5d09ec6bf7ae75f1e70275b))
+
+
+### Bug Fixes
+
+* **evaluations:** retry the reconcile PATCH on transient failures ([#305](https://github.com/launchdarkly/python-ai-sdk/issues/305)) ([a7c3718](https://github.com/launchdarkly/python-ai-sdk/commit/a7c371888c7832be9c85148be7cbb0d4991c64e2))
+* **langchain:** write aws.bedrock as the Bedrock provider name ([#297](https://github.com/launchdarkly/python-ai-sdk/issues/297)) ([f5a9852](https://github.com/launchdarkly/python-ai-sdk/commit/f5a98523ec0c44a5231e8d896e2d6b08039ddc9c))
+
 ## [1.1.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-1.0.0...launchdarkly-ai-server-1.1.0) (2026-11-12)
 
 

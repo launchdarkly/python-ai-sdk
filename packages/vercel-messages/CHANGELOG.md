@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-vercel-messages-1.0.1...launchdarkly-ai-vercel-messages-1.0.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* write aws.bedrock as the Bedrock provider name in the Vercel, LiteLLM and OpenCode handlers ([#298](https://github.com/launchdarkly/python-ai-sdk/issues/298)) ([623e159](https://github.com/launchdarkly/python-ai-sdk/commit/623e15956a48c87fa14d575605623b2171d64a1a))
+
 ## [1.0.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-vercel-messages-1.0.0...launchdarkly-ai-vercel-messages-1.0.1) (2026-11-12)
 
 
