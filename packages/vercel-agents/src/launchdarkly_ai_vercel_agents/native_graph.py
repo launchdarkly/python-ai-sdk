@@ -195,7 +195,9 @@ def to_vercel_agents(
                 async with agents[current.key].run(
                     model=models[current.key],
                     messages=messages,
-                    params=build_request_params(current.config, ai),
+                    params=build_request_params(
+                        current.config, ai, model=models[current.key]
+                    ),
                 ) as stream:
                     async for _ in stream:
                         pass
