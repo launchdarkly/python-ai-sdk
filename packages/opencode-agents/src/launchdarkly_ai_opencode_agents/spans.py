@@ -109,26 +109,34 @@ def start_tool_span(tool_name: str, tool_call_id: str, parent: Any) -> Any:
     return span
 
 
-def finish_root_span(span: Any, response_model: str | None, usage: SpanUsage) -> None:
+def finish_root_span(
+    span: Any,
+    config: AiConfigRep,
+    usage: SpanUsage,
+    *,
+    include_response_model: bool = True,
+) -> None:
     """Writes model metadata and token totals onto the root. Does not end it."""
     if span is None:
         return
-    if response_model is not None:
-        span.set_attribute("gen_ai.response.model", response_model)
+    if include_response_model:
+        span.set_attribute("gen_ai.response.model", model_name(config))
     set_usage_span_attributes(span, usage)
 
 
 def finish_model_span(
     span: Any,
-    response_model: str | None,
+    config: AiConfigRep,
     usage: SpanUsage,
     finish_reason: str | None = None,
+    *,
+    include_response_model: bool = True,
 ) -> None:
     """Ends one ``chat`` span successfully."""
     if span is None:
         return
-    if response_model is not None:
-        span.set_attribute("gen_ai.response.model", response_model)
+    if include_response_model:
+        span.set_attribute("gen_ai.response.model", model_name(config))
     if finish_reason:
         span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
     set_usage_span_attributes(span, usage)

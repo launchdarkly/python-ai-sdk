@@ -57,7 +57,6 @@ from .spans import (
     finish_model_span,
     finish_root_span,
     mark_ok,
-    model_name,
     parent_context_of,
     start_model_span,
     start_root_span,
@@ -546,10 +545,12 @@ class _Reducer:
         if span is None:
             return
         # OpenCode assistant modelID is selected before Bedrock inference.
-        response_model = (
-            model_name(self._config) if self._bedrock_request_model is None else None
+        finish_model_span(
+            span,
+            self._config,
+            _message_usage(tokens),
+            include_response_model=self._bedrock_request_model is None,
         )
-        finish_model_span(span, response_model, _message_usage(tokens))
 
     def _add_usage(self, tokens: Mapping[str, Any]) -> None:
         self._saw_usage = True
@@ -1008,8 +1009,9 @@ class OpenCodeHandler(ProviderHandler):
             usage = created.usage
             finish_root_span(
                 span,
-                model_name(config) if bedrock_request_model is None else None,
+                config,
                 add_cached_tokens_to_input(usage) if usage is not None else SpanUsage(),
+                include_response_model=bedrock_request_model is None,
             )
             mark_ok(span)
             done: dict[str, Any] = {"type": "done", "output": output}
