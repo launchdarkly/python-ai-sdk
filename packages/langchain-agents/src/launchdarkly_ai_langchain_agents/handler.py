@@ -277,6 +277,12 @@ def _rebuild_anthropic_output_config(kwargs: dict[str, Any]) -> dict[str, Any]:
 #: * ``mcp_servers``: attaches remote MCP servers, which then receive the conversation.
 #: * ``reuse_last_container``: reuses server-side container state from an earlier request, not
 #:   a model setting.
+#: * ``container``: the server-side code execution container a request runs in or reuses, and
+#:   the skills loaded into it. Server-side state, as Claude Messages ``container`` is.
+#: * ``reasoning_effort``: the field ``effort`` is an alias of. The setting is forwarded under
+#:   the cross-SDK name ``effort``; this spelling is not on the list.
+#: * ``user_profile_id``: attribution. It names the party a request is made on behalf of, and
+#:   switches ``ChatAnthropic`` to the beta client with the ``user-profiles`` beta.
 #: * ``default_request_timeout``, ``timeout``, ``max_retries``: timeouts and retries.
 #: * ``stream_usage``: how usage is reported back to the handler.
 #: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
@@ -294,6 +300,9 @@ _CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "model_kwargs",
     "mcp_servers",
     "reuse_last_container",
+    "container",
+    "reasoning_effort",
+    "user_profile_id",
     "default_request_timeout",
     "timeout",
     "max_retries",
