@@ -167,9 +167,11 @@ class ToolDefinitionInput:
 #: Every provider spelling this SDK actually serves, mapped onto semconv's vocabulary.
 #:
 #: The vocabulary is ``stop``, ``length``, ``content_filter``, ``tool_calls`` and ``error``.
-#: Anthropic and OpenAI are the only two vendors behind these six handlers, so they are the only
-#: two groups here. Keys are compared lower-cased, which costs one ``lower()`` and means a provider
-#: that shouts its enum is mapped rather than passed through as a stray value.
+#: Anthropic and OpenAI are the two vendors behind most of these handlers. The LangChain handlers
+#: also build a Gemini model, whose ``STOP`` and ``MAX_TOKENS`` already land on the rows below, so
+#: only its blocking reasons need rows of their own. Keys are compared lower-cased, which costs one
+#: ``lower()`` and means a provider that shouts its enum is mapped rather than passed through as a
+#: stray value.
 #:
 #: ``pause_turn`` is deliberately absent. Anthropic returns it when a long-running server-side tool
 #: suspends a turn that has not actually finished, and no semconv value means "did not finish", so
@@ -191,6 +193,13 @@ _SEMCONV_FINISH_REASONS: dict[str, str] = {
     "tool_calls": "tool_calls",
     "content_filter": "content_filter",
     "function_call": "tool_calls",
+    # Gemini `finishReason`: the reasons a reply was blocked
+    "safety": "content_filter",
+    "recitation": "content_filter",
+    "blocklist": "content_filter",
+    "prohibited_content": "content_filter",
+    "spii": "content_filter",
+    "image_safety": "content_filter",
 }
 
 

@@ -52,8 +52,10 @@ EXTRA_IMPORTS = {
     ("launchdarkly-ai-python", "otel"): _OTEL,
     ("launchdarkly-ai-langchain-agents", "anthropic"): ["langchain_anthropic"],
     ("launchdarkly-ai-langchain-agents", "aws"): ["langchain_aws"],
+    ("launchdarkly-ai-langchain-agents", "google"): ["langchain_google_genai"],
     ("launchdarkly-ai-langchain-messages", "anthropic"): ["langchain_anthropic"],
     ("launchdarkly-ai-langchain-messages", "aws"): ["langchain_aws"],
+    ("launchdarkly-ai-langchain-messages", "google"): ["langchain_google_genai"],
 }
 
 _REQUIREMENT = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[([^\]]*)\])?")

@@ -20,6 +20,8 @@ NEVER_FORWARDED_KEYS = frozenset(
         "openai_api_key",
         "anthropic_api_key",
         "bedrock_api_key",
+        "google_api_key",
+        "googleApiKey",
         "credentials",
         "credentials_profile_name",
         "auth_token",
@@ -39,6 +41,7 @@ NEVER_FORWARDED_KEYS = frozenset(
         "region",
         "region_name",
         "client_options",
+        "client_args",
         "client",
         "async_client",
         "http_client",
@@ -70,16 +73,20 @@ NEVER_FORWARDED_KEYS = frozenset(
         "model_kwargs",
         "provider_data",
         "additional_model_request_fields",
+        "additional_headers",
+        "default_metadata",
         "mock_response",
         # Remote tools.
         "mcp_servers",
         # Data location and retention.
         "inference_geo",
+        "location",
         "store",
         "prompt_cache_retention",
         # Server-side state.
         "container",
         "reuse_last_container",
+        "cached_content",
         "previous_response_id",
         "context_management",
         "truncation",
@@ -88,6 +95,7 @@ NEVER_FORWARDED_KEYS = frozenset(
         "user",
         "safety_identifier",
         "request_metadata",
+        "labels",
         # Runtime wiring and API-shape switches.
         "include",
         "include_usage",
@@ -100,6 +108,7 @@ NEVER_FORWARDED_KEYS = frozenset(
         "guardrails",
         "guardrail_config",
         "guard_last_turn_only",
+        "safety_settings",
         # Claude Agents host-process settings.
         "cli_path",
         "env",

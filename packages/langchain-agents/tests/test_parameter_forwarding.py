@@ -2,13 +2,14 @@
 Drift test for the LangChain chat model parameter classification in ``handler.py``.
 
 ``_CHAT_OPENAI_FORWARDED_KEYS`` / ``_CHAT_ANTHROPIC_FORWARDED_KEYS`` /
-``_CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS`` are literal, hand-maintained lists. This test reads each
+``_CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS`` / ``_CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS`` are literal, hand-maintained lists. This test reads each
 chat model's own ``model_fields`` (field names plus pydantic aliases) and asserts every key it
 accepts is classified in exactly one of forwarded, handler-owned, or excluded, so a field nobody has
 classified yet fails loudly by name, and so does a list entry that is not a real field.
 
-``langchain-aws`` is not a dependency of this package (Bedrock support is opt-in), so the
-``ChatBedrockConverse`` test skips itself when it is not installed.
+``langchain-aws`` and ``langchain-google-genai`` are not dependencies of this package (Bedrock and
+Gemini support are opt-in), so the ``ChatBedrockConverse`` and ``ChatGoogleGenerativeAI`` tests
+skip themselves when they are not installed.
 """
 
 from __future__ import annotations
@@ -29,6 +30,10 @@ from launchdarkly_ai_langchain_agents.handler import (
     _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS,
     _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
     _CHAT_BEDROCK_CONVERSE_OWNED_KEYS,
+    _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS,
+    _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS,
+    _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS,
+    _CHAT_GOOGLE_GENERATIVE_AI_RENAMES,
     _CHAT_OPENAI_EXCLUDED_KEYS,
     _CHAT_OPENAI_FORWARDED_KEYS,
     _CHAT_OPENAI_OWNED_KEYS,
@@ -38,6 +43,7 @@ from launchdarkly_ai_langchain_agents.handler import (
 from tests.forwarding_spec import (
     LANGCHAIN_CHAT_ANTHROPIC,
     LANGCHAIN_CHAT_BEDROCK_CONVERSE,
+    LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI,
     LANGCHAIN_CHAT_OPENAI,
     candidate_keys,
     probe_forwarded_keys,
@@ -159,6 +165,65 @@ class TestChatBedrockConverseAcceptsExactlyTheseKeys:
         )
 
 
+class TestChatGoogleGenerativeAIAcceptsExactlyTheseKeys:
+    def test_every_accepted_key_is_classified_exactly_once(self) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        accepted = _accepted_keys(lc_google.ChatGoogleGenerativeAI)
+        classified = (
+            _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS
+            | _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS
+            | _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS
+        )
+
+        unclassified = accepted - classified
+        assert not unclassified, (
+            f"ChatGoogleGenerativeAI now accepts {sorted(unclassified)}, not classified as "
+            "forwarded, handler-owned, or excluded in langchain-agents handler.py"
+        )
+
+        overlap = (
+            (
+                _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS
+                & _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS
+            )
+            | (
+                _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS
+                & _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS
+            )
+            | (
+                _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS
+                & _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS
+            )
+        )
+        assert not overlap, f"keys classified more than once: {sorted(overlap)}"
+
+    def test_every_classified_key_is_real(self) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        accepted = _accepted_keys(lc_google.ChatGoogleGenerativeAI)
+        stale = (
+            _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS
+            | _CHAT_GOOGLE_GENERATIVE_AI_OWNED_KEYS
+            | _CHAT_GOOGLE_GENERATIVE_AI_EXCLUDED_KEYS
+        ) - accepted
+        assert not stale, (
+            f"{sorted(stale)} classified in langchain-agents handler.py but "
+            "ChatGoogleGenerativeAI does not accept them"
+        )
+
+    def test_every_rename_joins_two_spellings_of_one_field(self) -> None:
+        """Each rename maps one spelling of a ``ChatGoogleGenerativeAI`` field onto its other
+        spelling, the table key, so a config that sets both reaches the class under one name."""
+        lc_google = pytest.importorskip("langchain_google_genai")
+        fields = lc_google.ChatGoogleGenerativeAI.model_fields
+        spellings = {
+            frozenset({name, field.alias})
+            for name, field in fields.items()
+            if field.alias and field.alias != name
+        }
+        for other, key in _CHAT_GOOGLE_GENERATIVE_AI_RENAMES.items():
+            assert frozenset({other, key}) in spellings, (other, key)
+
+
 class TestModelFieldAliasesAreNeverForwarded:
     """``model_name`` / ``model_id`` are the same constructor field as ``model``. A config value
     for them must not be forwarded, or it would collide with the model the handler resolves."""
@@ -210,6 +275,7 @@ class TestNeverForwardedKeys:
             ("openai", _CHAT_OPENAI_FORWARDED_KEYS),
             ("anthropic", _CHAT_ANTHROPIC_FORWARDED_KEYS),
             ("bedrock", _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS),
+            ("gemini", _CHAT_GOOGLE_GENERATIVE_AI_FORWARDED_KEYS),
         ],
     )
     def test_constructor_kwargs_hold_none_of_them(
@@ -272,7 +338,12 @@ def _build(provider: str, parameters: dict[str, Any]) -> dict[str, Any]:
     """Runs ``_make_default_chat_model`` for *provider* against a recording constructor and
     returns the kwargs it passed."""
     ctor = MagicMock()
-    module = MagicMock(ChatOpenAI=ctor, ChatAnthropic=ctor, ChatBedrockConverse=ctor)
+    module = MagicMock(
+        ChatOpenAI=ctor,
+        ChatAnthropic=ctor,
+        ChatBedrockConverse=ctor,
+        ChatGoogleGenerativeAI=ctor,
+    )
     with patch("importlib.import_module", return_value=module):
         _make_default_chat_model(_probe_config(provider, parameters))
     kwargs: dict[str, Any] = ctor.call_args.kwargs
@@ -313,6 +384,12 @@ class TestForwardsExactlyTheCrossSdkList:
                 "ChatBedrockConverse",
                 LANGCHAIN_CHAT_BEDROCK_CONVERSE,
             ),
+            (
+                "gemini",
+                "langchain_google_genai",
+                "ChatGoogleGenerativeAI",
+                LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI,
+            ),
         ],
     )
     async def test_forwarded_keys(
@@ -351,6 +428,7 @@ class TestMalformedObjectValuesAreDropped:
             ("openai", {"logit_bias": "none"}),
             ("anthropic", {"thinking": "enabled", "output_config": "json"}),
             ("bedrock", {"performance_config": "optimized"}),
+            ("gemini", {"thinking_config": {"include_thoughts": True}}),
         ],
     )
     def test_dropped(self, provider: str, parameters: dict[str, Any]) -> None:
@@ -575,3 +653,115 @@ def test_reasoning_effort_keeps_chat_openai_on_chat_completions() -> None:
     assert "messages" in payload
     assert "input" not in payload
     assert "reasoning" not in payload
+
+
+class TestGeminiAliasRenames:
+    """``max_tokens`` and ``stop`` are other spellings of the Gemini table keys ``max_output_tokens``
+    and ``stop_sequences``. Each is renamed before forwarding, and the table key wins when both are
+    set, as on every other route."""
+
+    @pytest.mark.parametrize(
+        ("other", "key", "other_value", "key_value"),
+        [
+            ("max_tokens", "max_output_tokens", 300, 200),
+            ("stop", "stop_sequences", ["A"], ["B"]),
+        ],
+    )
+    def test_the_other_spelling_becomes_the_key_and_the_key_wins(
+        self, other: str, key: str, other_value: Any, key_value: Any
+    ) -> None:
+        assert _build("gemini", {other: other_value}) == {
+            "model": "configured-model",
+            key: other_value,
+        }
+        assert _build("gemini", {other: other_value, key: key_value}) == {
+            "model": "configured-model",
+            key: key_value,
+        }
+
+    def test_the_real_class_accepts_the_forwarded_kwargs(self) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        for key in sorted(LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI):
+            kwargs = _build("gemini", {key: sample(key)})
+            kwargs["model"] = "gemini-3.1-pro-preview"
+            lc_google.ChatGoogleGenerativeAI(**kwargs)
+
+
+class TestGeminiValueRules:
+    """The value rules in the Gemini table: the thinking keys, ``media_resolution`` and the
+    Python field name ``reasoning_effort``."""
+
+    @pytest.mark.parametrize("level", ["low", "LOW", "Medium", "minimal", "xhigh"])
+    def test_thinking_level_is_kept_in_lower_case(self, level: str) -> None:
+        assert _build("gemini", {"thinking_level": level}) == {
+            "model": "configured-model",
+            "thinking_level": level.lower(),
+        }
+
+    @pytest.mark.parametrize("level", ["max", "", 2, None, {"level": "low"}])
+    def test_an_unknown_thinking_level_is_dropped(self, level: Any) -> None:
+        assert _build("gemini", {"thinking_level": level}) == {
+            "model": "configured-model"
+        }
+
+    @pytest.mark.parametrize("budget", [-1, 0, 2048])
+    def test_a_whole_number_thinking_budget_is_kept(self, budget: int) -> None:
+        assert _build("gemini", {"thinking_budget": budget}) == {
+            "model": "configured-model",
+            "thinking_budget": budget,
+        }
+
+    @pytest.mark.parametrize("budget", [1.5, "2048", True, None])
+    def test_any_other_thinking_budget_is_dropped(self, budget: Any) -> None:
+        assert _build("gemini", {"thinking_budget": budget}) == {
+            "model": "configured-model"
+        }
+
+    def test_thinking_level_wins_over_thinking_budget(self) -> None:
+        assert _build(
+            "gemini", {"thinking_level": "HIGH", "thinking_budget": 2048}
+        ) == {
+            "model": "configured-model",
+            "thinking_level": "high",
+        }
+
+    def test_an_unknown_thinking_level_leaves_the_budget(self) -> None:
+        assert _build("gemini", {"thinking_level": "max", "thinking_budget": 2048}) == {
+            "model": "configured-model",
+            "thinking_budget": 2048,
+        }
+
+    @pytest.mark.parametrize(
+        "resolution",
+        ["MEDIA_RESOLUTION_LOW", "media_resolution_medium", "Media_Resolution_High"],
+    )
+    def test_media_resolution_is_kept_in_upper_case(self, resolution: str) -> None:
+        assert _build("gemini", {"media_resolution": resolution}) == {
+            "model": "configured-model",
+            "media_resolution": resolution.upper(),
+        }
+
+    @pytest.mark.parametrize(
+        "resolution", ["MEDIA_RESOLUTION_ULTRA", "low", "", 1, None]
+    )
+    def test_any_other_media_resolution_is_dropped(self, resolution: Any) -> None:
+        assert _build("gemini", {"media_resolution": resolution}) == {
+            "model": "configured-model"
+        }
+
+    def test_reasoning_effort_is_not_read(self) -> None:
+        assert _build("gemini", {"reasoning_effort": "low"}) == {
+            "model": "configured-model"
+        }
+
+    def test_the_real_class_takes_the_rebuilt_values(self) -> None:
+        lc_google = pytest.importorskip("langchain_google_genai")
+        kwargs = _build(
+            "gemini",
+            {"thinking_level": "LOW", "media_resolution": "media_resolution_high"},
+        )
+        kwargs["model"] = "gemini-3.1-pro-preview"
+        model = lc_google.ChatGoogleGenerativeAI(**kwargs)
+        assert model.reasoning_effort == "low"
+        assert model.media_resolution is not None
+        assert model.media_resolution.value == "MEDIA_RESOLUTION_HIGH"

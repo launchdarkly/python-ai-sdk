@@ -21,9 +21,10 @@ def model_name(config: AiConfigRep) -> str:
 
 
 def serving_provider(config: AiConfigRep) -> str:
-    """The configured provider, lower-cased, with Bedrock as its semconv value ``aws.bedrock``."""
+    """The configured provider, lower-cased, with Bedrock and Gemini as their semconv values
+    ``aws.bedrock`` and ``gcp.gemini``."""
     provider = str(config.get("provider", {}).get("name") or "vercel").lower()
-    return "aws.bedrock" if provider == "bedrock" else provider
+    return {"bedrock": "aws.bedrock", "gemini": "gcp.gemini"}.get(provider, provider)
 
 
 def start_root_span(

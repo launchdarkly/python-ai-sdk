@@ -185,6 +185,24 @@ LANGCHAIN_CHAT_BEDROCK_CONVERSE = frozenset(
     }
 )
 
+LANGCHAIN_CHAT_GOOGLE_GENERATIVE_AI = frozenset(
+    {
+        "frequency_penalty",
+        "max_output_tokens",
+        "max_tokens",
+        "media_resolution",
+        "presence_penalty",
+        "seed",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "thinking_budget",
+        "thinking_level",
+        "top_k",
+        "top_p",
+    }
+)
+
 #: Keys the UI or another provider uses that are on none of the lists above for some handler, so
 #: every probe also checks they are dropped.
 _OFF_LIST_KEYS = frozenset(
@@ -246,6 +264,7 @@ SAMPLE_VALUES: Mapping[str, Any] = {
     "max_tokens_to_sample": 555,
     "max_tool_calls": 3,
     "max_turns": 4,
+    "media_resolution": "MEDIA_RESOLUTION_LOW",
     "n": 2,
     "output_config": {"effort": "high"},
     "output_format": {"type": "json_schema", "schema": {"type": "object"}},
@@ -262,6 +281,8 @@ SAMPLE_VALUES: Mapping[str, Any] = {
     "temperature": 0.2,
     "text": {"verbosity": "low"},
     "thinking": {"type": "enabled", "budget_tokens": 1024},
+    "thinking_budget": 2048,
+    "thinking_level": "medium",
     "tool_choice": {"type": "auto"},
     "top_k": 7,
     "top_logprobs": 2,

@@ -41,7 +41,7 @@ def model_name(config: AiConfigRep) -> str:
 
 
 def provider_name(config: AiConfigRep) -> str:
-    """Who served the model, from the variation (Bedrock as its semconv value ``aws.bedrock``),
+    """Who served the model, from the variation (Bedrock and Gemini as their semconv values ``aws.bedrock`` and ``gcp.gemini``),
     or ``opencode`` when it is blank."""
     if isinstance(config, dict):
         provider = config.get("provider")
@@ -49,7 +49,9 @@ def provider_name(config: AiConfigRep) -> str:
             name = provider.get("name")
             if isinstance(name, str) and name.strip():
                 lowered = name.strip().lower()
-                return "aws.bedrock" if lowered == "bedrock" else lowered
+                return {"bedrock": "aws.bedrock", "gemini": "gcp.gemini"}.get(
+                    lowered, lowered
+                )
     return "opencode"
 
 

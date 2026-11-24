@@ -809,7 +809,12 @@ class TestForwardsExactlyTheCrossSdkList:
 
 @pytest.mark.parametrize(
     ("provider_name", "expected"),
-    [("Bedrock", "aws.bedrock"), ("bedrock", "aws.bedrock"), ("Azure", "azure")],
+    [
+        ("Bedrock", "aws.bedrock"),
+        ("bedrock", "aws.bedrock"),
+        ("Gemini", "gcp.gemini"),
+        ("Azure", "azure"),
+    ],
 )
 def test_root_and_chat_spans_write_the_provider_name(
     provider_name: str, expected: str

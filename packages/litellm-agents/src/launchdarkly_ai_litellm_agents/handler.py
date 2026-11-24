@@ -311,11 +311,12 @@ def _direct_usage(raw: Any) -> SpanUsage:
 
 
 def _provider_name(config_value: AiConfigRep) -> str:
-    """The configured provider, lower-cased, with Bedrock as its semconv value ``aws.bedrock``."""
+    """The configured provider, lower-cased, with Bedrock and Gemini as their semconv values
+    ``aws.bedrock`` and ``gcp.gemini``."""
     provider = str(
         (config_value.get("provider") or {}).get("name") or "litellm"
     ).lower()
-    return "aws.bedrock" if provider == "bedrock" else provider
+    return {"bedrock": "aws.bedrock", "gemini": "gcp.gemini"}.get(provider, provider)
 
 
 def _root_span(

@@ -14,12 +14,15 @@ pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-langchain-messages
 
 The default model is `ChatOpenAI`, so set `OPENAI_API_KEY` unless you pass a custom `BaseChatModel`.
 
-`langchain-openai` is a dependency, so the default model works with the install above. For AI configs whose provider is Anthropic or Bedrock, install the matching extra:
+`langchain-openai` is a dependency, so the default model works with the install above. For AI configs whose provider is Anthropic, Bedrock, or Gemini, install the matching extra:
 
 ```bash
 pip install "launchdarkly-ai-langchain-messages[anthropic]"  # langchain-anthropic
 pip install "launchdarkly-ai-langchain-messages[aws]"        # langchain-aws (Bedrock)
+pip install "launchdarkly-ai-langchain-messages[google]"     # langchain-google-genai (Gemini)
 ```
+
+Without a model passed in, the handler builds one from the lowercased `provider.name`: `anthropic` builds `ChatAnthropic`, `bedrock` builds `ChatBedrockConverse`, `gemini` builds `ChatGoogleGenerativeAI`, and anything else builds `ChatOpenAI`.
 
 ## Usage
 
@@ -104,6 +107,7 @@ asyncio.run(main())
 | Variable | Description |
 |---|---|
 | `OPENAI_API_KEY` | Required when using the default `ChatOpenAI` model |
+| `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) | Required for `provider.name = Gemini` when the handler builds the default `ChatGoogleGenerativeAI` model |
 | `LD_SDK_KEY` | LaunchDarkly server-side SDK key |
 | `LD_SERVICE_NAME` | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | `deployment.environment` attribute attached to telemetry |

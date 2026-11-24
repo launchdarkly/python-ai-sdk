@@ -22,7 +22,16 @@ The `'*'` wildcard means this handler acts as a fallback for any `meta.mode == "
 
 > **Priority rule:** if the caller also registers an explicit provider handler (e.g. `('OpenAI', 'messages')`), that handler takes precedence over the wildcard for matching variations.
 
-The handler is model-agnostic — it accepts any `BaseChatModel`. The default is `ChatOpenAI`.
+The handler is model-agnostic — it accepts any `BaseChatModel`. With no `llm`, it builds one from `config.provider.name` (case-insensitive):
+
+| Provider name | Model | Install |
+|---|---|---|
+| `anthropic` | `ChatAnthropic` | `pip install "launchdarkly-ai-langchain-messages[anthropic]"` |
+| `bedrock` | `ChatBedrockConverse` | `pip install "launchdarkly-ai-langchain-messages[aws]"` |
+| `gemini` | `ChatGoogleGenerativeAI` | `pip install "launchdarkly-ai-langchain-messages[google]"` |
+| anything else | `ChatOpenAI` | included |
+
+A missing integration package raises `ImportError` naming the extra to install, and the run ends with the root span in ERROR on both `invoke` and `stream`. `ChatGoogleGenerativeAI` uses the Gemini Developer API with its key from the environment only: `GOOGLE_API_KEY`, or `GEMINI_API_KEY` when `GOOGLE_API_KEY` is unset or empty. With neither set, the run fails with a `ValueError` naming both before any request. An empty `model.name` runs on `gemini-2.5-flash`. Gemini 3 needs each thought signature sent back on the next turn; the streaming tool loop keeps the model's `additional_kwargs` (function-call signatures) and its signed text blocks (text-part signatures) on the assistant turn it rebuilds, which is where `langchain-google-genai` stores them.
 
 ---
 
@@ -39,7 +48,7 @@ The handler is model-agnostic — it accepts any `BaseChatModel`. The default is
 ## Exports
 
 ```python
-# Factory — accepts an optional BaseChatModel; defaults to ChatOpenAI()
+# Factory — accepts an optional BaseChatModel; defaults to the model for config.provider.name
 def create_lang_chain_handler(llm=None) -> ProviderHandler: ...
 
 # Convenience wrapper — equivalent to config(key=config_key, handler=create_langchain_messages_handler()).invoke(user_input, context)
@@ -175,6 +184,7 @@ Span names and attributes are described in [Implementation Details → Telemetry
 |---|---|
 | `langchain-core` | `BaseChatModel`, `HumanMessage`, `SystemMessage`, `AIMessage`, `ToolMessage` |
 | `langchain-openai` | `ChatOpenAI` (default model, imported lazily) |
+| `langchain-anthropic`, `langchain-aws`, `langchain-google-genai` | Optional, through the `[anthropic]`, `[aws]` and `[google]` extras; imported lazily for the matching provider |
 | `launchdarkly-ai-server` | `AiConfigRep`, `ProviderHandler`, `parse_template`, `create_handler` |
 | `opentelemetry-api` | `StatusCode`, `trace.get_tracer().start_span()` for span creation |
 

@@ -299,6 +299,12 @@ Used by the Anthropic pair and the LangChain pair only. Compare keys lower-cased
 | `tool_calls` | `tool_calls` | OpenAI |
 | `content_filter` | `content_filter` | OpenAI |
 | `function_call` | `tool_calls` | OpenAI |
+| `safety` | `content_filter` | Gemini |
+| `recitation` | `content_filter` | Gemini |
+| `blocklist` | `content_filter` | Gemini |
+| `prohibited_content` | `content_filter` | Gemini |
+| `spii` | `content_filter` | Gemini |
+| `image_safety` | `content_filter` | Gemini |
 
 Anything not in that table passes through unchanged. Do not coerce it to `stop`. A word that
 arrives unmapped is the signal to add a row here.
@@ -314,6 +320,9 @@ choices.
 
 The OpenAI rows exist because the LangChain handlers can serve an OpenAI model and do see these
 words. The two OpenAI handlers never do. See 5a.
+
+The Gemini rows exist because the LangChain handlers build a Gemini model for `provider.name`
+`Gemini`. Gemini's `STOP` and `MAX_TOKENS` already map through the `stop` and `max_tokens` rows.
 
 ### 5a. The two OpenAI handlers derive it instead
 
@@ -659,13 +668,14 @@ Python matches TypeScript here. The Python LangChain handlers put the literal `l
 `gen_ai.system` (`LEGACY_SYSTEM` in `launchdarkly_ai_langchain_messages/spans.py`).
 
 `gen_ai.provider.name` on the two LangChain handlers is a passthrough of the configured provider
-(`serving_provider`): the name lower-cased, `openai` when it is unset or empty, with one mapping:
-a name that lower-cases to `bedrock` is written `aws.bedrock`, its semconv value. Azure, Cohere,
-a typo and any other name pass through lower-cased.
+(`serving_provider`): the name lower-cased, `openai` when it is unset or empty, with two mappings
+to semconv values: a name that lower-cases to `bedrock` is written `aws.bedrock`, and one that
+lower-cases to `gemini` is written `gcp.gemini`. Azure, Cohere, a typo and any other name pass
+through lower-cased.
 
 Evaluation spans write the configured provider on both keys (`_provider_name` in
-`launchdarkly_ai_server/evaluations/spans.py`): lower-cased, `aws.bedrock` for Bedrock, and
-empty, not `openai`, when no provider is configured.
+`launchdarkly_ai_server/evaluations/spans.py`): lower-cased, `aws.bedrock` for Bedrock, `gcp.gemini` for
+Gemini, and empty, not `openai`, when no provider is configured.
 
 ---
 
