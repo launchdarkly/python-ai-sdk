@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1978,32 +1978,42 @@ class TestNativeGraphDefaultModelFollowsProvider:
     async def test_missing_extra_raises_the_install_hint(
         self, provider: str, module: str, extra: str
     ) -> None:
+        """A missing optional package fails the run, not the build: ``invoke()`` raises the
+        install hint with the import error as its cause, tracks the invocation failure, and ends
+        the ``launchdarkly.graph`` span with ERROR."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
         mocks = _make_langgraph_mocks(_make_ai_msg("final"))
         # A None entry in sys.modules makes the import raise ModuleNotFoundError.
         mocks[module] = None
-        tracked: list[str] = []
+        fake_trace, exporter, end_spies = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
         client = MagicMock()
-        client.track = MagicMock(side_effect=lambda evt, *_a: tracked.append(evt))
+        client.track = MagicMock(
+            side_effect=lambda evt, _ctx, data, _val: track_calls.append((evt, data))
+        )
         graph_def = _single_node_graph(provider, {"name": "m"})
+        runner = to_lang_graph(
+            _make_def_promise(graph_def), {"context": {"kind": "user", "key": "u"}}
+        )
 
         with (
             _patch_imports(mocks),
-            patch(
-                "launchdarkly_ai_langchain_agents.native_graph.get_client",
-                return_value=client,
-            ),
+            patch.object(ng_mod, "trace", fake_trace),
+            patch.object(ng_mod, "_HAS_OTEL", True),
+            patch.object(ng_mod, "get_client", return_value=client),
         ):
             with pytest.raises(
                 ImportError,
                 match=rf"pip install \"launchdarkly-ai-langchain-agents\[{extra}\]\"",
-            ):
-                await to_lang_graph(
-                    _make_def_promise(graph_def),
-                    {"context": {"kind": "user", "key": "u"}},
-                ).invoke("hi")
+            ) as raised:
+                await runner.invoke("hi")
 
+        assert isinstance(raised.value.__cause__, ImportError)
         mocks["langchain_openai"].ChatOpenAI.assert_not_called()
-        assert tracked == ["$ld:ai:graph:invocation_failure"]
+        _assert_one_failed_graph_span(
+            exporter, end_spies, str(raised.value), track_calls
+        )
 
 
 class TestNativeGraphRealProviderModels:
@@ -2120,3 +2130,100 @@ class TestNativeGraphRealProviderModels:
         assert result["response"] == "the cook did it"
         assert {type(m).__name__ for m in built} == {"ChatBedrockConverse"}
         assert len(built) == 3
+
+
+class TestNativeGraphMixedProviders:
+    """One graph whose nodes name three providers builds one model of each class, one per
+    node, through a real ``StateGraph``, and the hand-off reaches the second provider with the
+    history rewritten to plain turns."""
+
+    @pytest.mark.asyncio
+    async def test_anthropic_hands_off_to_bedrock_beside_an_openai_node(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lc_anthropic = pytest.importorskip("langchain_anthropic")
+        lc_aws = pytest.importorskip("langchain_aws")
+        import langchain_openai
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+        classes = {
+            "anthropic": lc_anthropic.ChatAnthropic,
+            "bedrock": lc_aws.ChatBedrockConverse,
+            "openai": langchain_openai.ChatOpenAI,
+        }
+        replies: dict[str, list[Any]] = {
+            "anthropic": [_tool_call_msg(("transfer_to_billing", "toolu_1"))],
+            "bedrock": [AIMessage(content="billing fixed it")],
+            "openai": [],
+        }
+        received: dict[str, list[list[Any]]] = {name: [] for name in classes}
+        built: list[str] = []
+
+        def scripted(name: str) -> Any:
+            async def _agenerate(
+                self: Any, messages: list[Any], stop: Any = None, **kwargs: Any
+            ) -> Any:
+                received[name].append(list(messages))
+                return ChatResult(
+                    generations=[ChatGeneration(message=replies[name].pop(0))]
+                )
+
+            return _agenerate
+
+        def spied(name: str, cls: Any) -> Any:
+            real_init = cls.__init__
+
+            def _init(self: Any, *args: Any, **kwargs: Any) -> None:
+                real_init(self, *args, **kwargs)
+                built.append(name)
+
+            return _init
+
+        graph_def = _make_graph_def(
+            nodes={
+                "router": _provider_node(
+                    "router",
+                    "Anthropic",
+                    {"name": "claude-sonnet-4-5"},
+                    edges=["billing", "support"],
+                ),
+                "billing": _provider_node(
+                    "billing", "Bedrock", {"name": "anthropic.claude-haiku-4-5"}
+                ),
+                "support": _provider_node("support", "OpenAI", {"name": "gpt-4o-mini"}),
+            },
+            edges=[
+                {"source_key": "router", "target_key": "billing"},
+                {"source_key": "router", "target_key": "support"},
+            ],
+            root_key="router",
+        )
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("launchdarkly_ai_langchain_agents.native_graph._HAS_OTEL", False)
+            )
+            for name, cls in classes.items():
+                stack.enter_context(patch.object(cls, "_agenerate", scripted(name)))
+                stack.enter_context(patch.object(cls, "__init__", spied(name, cls)))
+            result = await to_lang_graph(_make_def_promise(graph_def)).invoke(
+                "my invoice is wrong"
+            )
+
+        assert result["response"] == "billing fixed it"
+        assert sorted(built) == ["anthropic", "bedrock", "openai"]
+        assert len(received["anthropic"]) == 1
+        assert received["openai"] == []
+        (billing_messages,) = received["bedrock"]
+        # The router's turns reach Bedrock as plain text, with no function calls to replay.
+        assert not any(getattr(m, "tool_calls", None) for m in billing_messages)
+        assert any(
+            type(m).__name__ == "HumanMessage"
+            and "my invoice is wrong" in str(m.content)
+            for m in billing_messages
+        )
