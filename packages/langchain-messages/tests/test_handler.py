@@ -3079,6 +3079,91 @@ class TestModelSource:
         assert list(attrs["gen_ai.response.finish_reasons"]) == ["content_filter"]
 
     @pytest.mark.asyncio
+    async def test_gemini_streaming_tool_loop_replays_the_thought_signature(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Gemini 3 rejects a turn whose function call lost its thought signature. The streaming
+        tool loop rebuilds the assistant turn, so the second request must still carry the
+        signature the first reply sent, through the real ``ChatGoogleGenerativeAI``."""
+        pytest.importorskip("langchain_google_genai")
+        from google.genai import types
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        signature = b"sig-from-turn-one"
+        replies = [
+            types.GenerateContentResponse(
+                candidates=[
+                    types.Candidate(
+                        content=types.Content(
+                            role="model",
+                            parts=[
+                                types.Part(
+                                    function_call=types.FunctionCall(
+                                        name="search", args={"q": "x"}
+                                    ),
+                                    thought_signature=signature,
+                                )
+                            ],
+                        ),
+                        finish_reason=types.FinishReason.STOP,
+                    )
+                ]
+            ),
+            types.GenerateContentResponse(
+                candidates=[
+                    types.Candidate(
+                        content=types.Content(
+                            role="model", parts=[types.Part(text="done")]
+                        ),
+                        finish_reason=types.FinishReason.STOP,
+                    )
+                ]
+            ),
+        ]
+        requests: list[Any] = []
+
+        async def fake_stream(**kwargs: Any) -> Any:
+            requests.append(kwargs["contents"])
+            reply = replies.pop(0)
+
+            async def chunks() -> AsyncGenerator[Any, None]:
+                yield reply
+
+            return chunks()
+
+        build = handler_mod._make_default_chat_model
+
+        def stubbed(*args: Any, **kwargs: Any) -> Any:
+            model = build(*args, **kwargs)
+            model.client.aio.models.generate_content_stream = fake_stream
+            return model
+
+        cfg = {
+            **_with_tools(CONFIG, "search"),
+            "provider": {"name": "Gemini"},
+            "model": {"name": "gemini-3.1-pro-preview"},
+        }
+        with patch.object(handler_mod, "_make_default_chat_model", stubbed):
+            events = [
+                event
+                async for event in await create_langchain_messages_handler().stream(
+                    cfg, "q", {"search": lambda _args: "found"}
+                )
+            ]
+        assert any(event.get("delta") == "done" for event in events)
+        assert len(requests) == 2
+        replayed = [
+            part
+            for content in requests[1]
+            for part in (content.parts or [])
+            if part.function_call is not None
+        ]
+        assert [part.thought_signature for part in replayed] == [signature]
+
+    @pytest.mark.asyncio
     async def test_non_bedrock_ignores_model_region(self) -> None:
         ctx, _rec = _recording()
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler

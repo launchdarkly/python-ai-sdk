@@ -1562,8 +1562,17 @@ async def _stream_gen(
                     yield rich
             for rich in emitter.end_text():
                 yield rich
+            # Keep the gathered chunk's metadata. langchain-google-genai holds each function call's
+            # thought signature in additional_kwargs, and Gemini 3 rejects the next turn without it.
             assistant_msg = AIMessage(
-                content=accumulated_content, tool_calls=accumulated_tool_calls
+                content=accumulated_content,
+                tool_calls=accumulated_tool_calls,
+                additional_kwargs=dict(
+                    getattr(gathered, "additional_kwargs", None) or {}
+                ),
+                response_metadata=dict(
+                    getattr(gathered, "response_metadata", None) or {}
+                ),
             )
             conversation_messages.append(assistant_msg)
 

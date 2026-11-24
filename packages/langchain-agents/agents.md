@@ -22,7 +22,16 @@ The `'*'` wildcard means this handler acts as a fallback for any `meta.mode == "
 
 > **Priority rule:** if the caller also registers an explicit provider handler (e.g. `['OpenAI', 'agent']`), that handler takes precedence over the wildcard for matching variations.
 
-The handler is model-agnostic — it accepts any `BaseChatModel`. The default is `ChatOpenAI`.
+The handler is model-agnostic — it accepts any `BaseChatModel`. With no `llm`, it builds one from `config.provider.name` (case-insensitive):
+
+| Provider name | Model | Install |
+|---|---|---|
+| `anthropic` | `ChatAnthropic` | `pip install "launchdarkly-ai-langchain-agents[anthropic]"` |
+| `bedrock` | `ChatBedrockConverse` | `pip install "launchdarkly-ai-langchain-agents[aws]"` |
+| `gemini` | `ChatGoogleGenerativeAI` | `pip install "launchdarkly-ai-langchain-agents[google]"` |
+| anything else | `ChatOpenAI` | included |
+
+A missing integration package raises `ImportError` naming the extra to install. `ChatGoogleGenerativeAI` uses the Gemini Developer API and reads its key from `GOOGLE_API_KEY`, falling back to `GEMINI_API_KEY`. Gemini 3 needs each function call's thought signature sent back on the next turn; LangGraph replays the model's own `AIMessage`, whose `additional_kwargs` is where `langchain-google-genai` stores them.
 
 ---
 
@@ -41,7 +50,7 @@ The handler is model-agnostic — it accepts any `BaseChatModel`. The default is
 ## Exports
 
 ```python
-# Factory — accepts an optional BaseChatModel; defaults to ChatOpenAI()
+# Factory — accepts an optional BaseChatModel; defaults to the model for config.provider.name
 def create_langchain_agents_handler(llm: BaseChatModel | None = None) -> ProviderHandler: ...
 
 # Convenience wrapper — equivalent to config(key=config_key, handler=create_langchain_agents_handler()).invoke(user_input, context)
@@ -188,6 +197,7 @@ Span names and attributes are described in [Implementation Details → Telemetry
 |---|---|
 | `langchain-core` | `BaseChatModel`, `HumanMessage`, `SystemMessage`, `AIMessage`, `BaseMessage`, `tool()` |
 | `langchain-openai` | `ChatOpenAI` (default model) |
+| `langchain-anthropic`, `langchain-aws`, `langchain-google-genai` | Optional, through the `[anthropic]`, `[aws]` and `[google]` extras; imported lazily for the matching provider |
 | `langchain` | `create_agent` |
 | `langgraph` | `StateGraph`, `ToolNode`, `tools_condition` |
 | `launchdarkly-ai-server` | `AiConfigRep`, `Tool`, `ProviderHandler`, `parse_template` |
