@@ -56,12 +56,11 @@ Never raises. Returns `{"enabled": bool, "config": dict | None, "meta": dict | N
 
 Agent Skills (`get_skill`, `write_skills`, `watch_skills` and the rest) are re-exported from this
 package's root. They need `launchdarkly-ai-server` 1.0.0 or later, the first release with Agent
-Skills in core. This package does not pin `launchdarkly-ai-server`, so upgrading it alone can leave
-an older one installed, and `from launchdarkly_ai_python import get_skill` then raises
-`ImportError`. Upgrade both:
+Skills in core. This package requires `launchdarkly-ai-server>=1.0.0,<2`, so upgrading it upgrades
+`launchdarkly-ai-server` only when the installed version is outside `>=1.0.0,<2`:
 
 ```bash
-pip install --upgrade launchdarkly-ai-python "launchdarkly-ai-server>=1.0.0"
+pip install --upgrade launchdarkly-ai-python
 ```
 
 ## Experimental features

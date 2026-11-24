@@ -93,7 +93,7 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 
 ### Versioning
 
-From 1.0.0 every package in this SDK is released at the same version, so install them at matching versions. Each package depends on `launchdarkly-ai-server` within the same major (`>=1.0,<2`), and a breaking change in any package is a new major for all of them. Names exported from `launchdarkly_ai_server.experimental` are the exception: they may change in a minor release.
+Each package has its own version, and release-please releases a package only when it changes, so the packages are not all at the same version. They all share major version 1: each package depends on `launchdarkly-ai-server` within that major (`>=1.0.0,<2` or `>=1.1.0,<2`), and a breaking change is a new major for the package it changes. Names exported from `launchdarkly_ai_server.experimental` are the exception: they may change in a minor release.
 
 Every third-party floor sits on the release line CI tests: the same major as the tested version for a 1.x or later library, the same minor for a 0.x one, where a minor release may break. A floor that was below that line was raised to the tested version; a floor already on it stayed where it was.
 
@@ -194,6 +194,8 @@ Use `create_handler(provides_for, fn)` to build a custom handler. It attaches ro
 | `registry` | `Registry` | No | Registry to source handlers and tools from |
 
 Returns a `ConfigInstance` with `.invoke(user_input, context, variables?)` and `.stream(user_input, context, variables?)`.
+
+Only the tools attached to the variation are offered to the model, and only those with an implementation in `tool_handlers`. If the model names a tool it was not offered, the call raises `ValueError: No handler registered for tool "<name>"`. A tool implementation receives the model's arguments as one `dict`.
 
 ```python
 import asyncio

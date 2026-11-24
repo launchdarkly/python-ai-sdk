@@ -38,6 +38,8 @@ asyncio.run(main())
 
 Entering the handler starts `opencode serve` and returns once it is healthy. The process stops when the context exits, after `config().stream()` returns. Put a wall-clock limit around `config().stream()`, not around the context. The handler yields AG-UI text and tool events. `config().stream()` yields `chunk` then `done`.
 
+For an `amazon-bedrock` model (provider Bedrock, or a `bedrock/...` model name), `model.region` (`us`, `global`, ...) is prepended to the model id as its cross-region inference-profile prefix, unless the id already has one or is an ARN. A config without a region is sent as configured.
+
 ## Tools
 
 The AI Config's `tools`, filtered to the keys also present in `tool_handlers`, is the only catalog the model sees for one call — every other tool on the running `opencode serve`, including every built-in, is denied. A variation with no tools (and every judge, which always calls with `tool_handlers=None`) gets a model with no tools at all.

@@ -89,6 +89,8 @@ asyncio.run(main())
 - Uses the system prompt and conversation history defined in your LaunchDarkly flag config.
 - Template placeholders (`{{variable}}`) in the prompt are substituted using `variables` before the call.
 - If tools are defined in the flag config, binds them to the model and executes them as requested, feeding results back until the model produces a final response.
+- Only the tools attached to the variation are offered to the model, and only those with a function in `tool_handlers`; a `NativeTool` is never offered. If the model names a tool it was not offered, the call raises `ValueError: No handler registered for tool "<name>"`. A tool implementation receives the model's arguments as one `dict`.
+- When the provider is Bedrock, `model.region` (`us`, `global`, ...) is prepended to the model id as its cross-region inference-profile prefix: `anthropic.claude-x` with region `us` becomes `us.anthropic.claude-x`. An id that already has a prefix, an ARN, or a config without a region is sent as configured. The default chat model and a model factory (`llm` as a function) get the rewritten name; a model instance you pass is used as built.
 - Emits an OTel span and LaunchDarkly telemetry for every call.
 
 ## Choosing Between `langchain-agents` and `langchain-messages`
@@ -98,6 +100,10 @@ asyncio.run(main())
 | Orchestration | LangGraph `StateGraph` | Manual tool loop |
 | Reasoning style | ReAct (reason + act cycles) | Single invoke per tool round-trip |
 | Best for | Complex multi-step reasoning | Straightforward tool calls |
+
+## Retries
+
+`create_langchain_messages_handler(max_retries=...)` sets how many times the default chat model (`ChatOpenAI`, `ChatAnthropic` or `ChatBedrockConverse`) retries a failed request before the error reaches the handler. `None`, the default, keeps that class's own default. It cannot be combined with `llm`, because the handler does not build that model: set `max_retries` on your model instead. A negative or non-integer value raises when the handler is built.
 
 ## Environment Variables
 
