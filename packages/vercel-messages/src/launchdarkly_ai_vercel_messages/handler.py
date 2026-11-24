@@ -301,14 +301,14 @@ async def _tool_result(
         # The tool name is untrusted model output. A name that was not offered fails the run,
         # as in every other handler; it is not handed back to the model to retry.
         error = ValueError(f'No handler registered for tool "{call.tool_name}"')
-        fail_span(tool_span, error)
+        fail_span(tool_span, error, error_type="tool_error")
         raise error
     try:
         result = await _call_tool(handler, _tool_args(call))
     except BaseException as exc:
         if isinstance(exc, Exception):
             # Surface ordinary tool failures to the model so it can recover.
-            fail_span(tool_span, exc)
+            fail_span(tool_span, exc, error_type="tool_error")
             return ai.tool_result_part(
                 call.tool_call_id,
                 tool_name=call.tool_name,

@@ -823,3 +823,86 @@ def test_root_and_chat_spans_write_the_provider_name(
     for span in recorder.spans:
         assert span.attributes["gen_ai.provider.name"] == expected
         assert span.attributes["gen_ai.system"] == "litellm"
+
+
+def _exported_spans() -> Any:
+    """A real TracerProvider and InMemorySpanExporter behind the handler's tracer lookup."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return patch.object(trace, "get_tracer", provider.get_tracer), exporter
+
+
+def _tool_spans(exporter: Any) -> dict[str, Any]:
+    return {
+        s.attributes["gen_ai.tool.name"]: s
+        for s in exporter.get_finished_spans()
+        if s.name.startswith("execute_tool")
+    }
+
+
+def _tool_context(name: str, call_id: str) -> Any:
+    return SimpleNamespace(tool_call_id=call_id, tool_name=name, tool_arguments="{}")
+
+
+class TestFailedToolSpanErrorType:
+    """TELEMETRY-CONTRACT.md sections 4 and 6: an ERROR tool span carries `error.type`
+    `tool_error` and no result; an OK or abandoned one carries no `error.type`.
+
+    A tool's raise propagates out of the run before ``on_tool_end``, so the failed call is the
+    one ``fail_open`` finds still open."""
+
+    @pytest.mark.parametrize("bad_call", ["raises", "unrecordable"])
+    async def test_marks_only_the_failed_call(self, bad_call: str) -> None:
+        from opentelemetry.trace import StatusCode
+
+        async def run(agent: Any, prompt: Any, *, hooks: Any, **_kwargs: Any) -> Any:
+            good, bad = SimpleNamespace(name="good"), SimpleNamespace(name="bad")
+            await hooks.on_tool_start(_tool_context("good", "c1"), agent, good)
+            await hooks.on_tool_end(_tool_context("good", "c1"), agent, good, "fine")
+            await hooks.on_tool_start(_tool_context("bad", "c2"), agent, bad)
+            if bad_call == "raises":
+                raise RuntimeError("tool exploded")
+            await hooks.on_tool_end(_tool_context("bad", "c2"), agent, bad, object())
+
+        ctx, exporter = _exported_spans()
+        with (
+            ctx,
+            _patch_agents(_agents_module(run=AsyncMock(side_effect=run))),
+            pytest.raises((RuntimeError, TypeError)),
+        ):
+            await create_litellm_agents_handler(
+                model_factory=lambda *_: object(), capture_content=True
+            )(CONFIG, "q")
+
+        tools = _tool_spans(exporter)
+        good, failed = tools["good"], tools["bad"]
+        assert good.status.status_code is StatusCode.OK
+        assert "error.type" not in good.attributes
+        assert good.attributes["gen_ai.tool.call.result"] == "fine"
+        assert failed.status.status_code is StatusCode.ERROR
+        assert failed.attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in failed.attributes
+
+    async def test_an_abandoned_call_gets_no_error_type(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        ctx, exporter = _exported_spans()
+        with ctx:
+            hooks = handler_mod._SpanningHooks(CONFIG, None, True, set())
+            await hooks.on_tool_start(
+                _tool_context("open", "c1"), MagicMock(), SimpleNamespace(name="open")
+            )
+            hooks.close_open(abandoned=True)
+
+        tool = _tool_spans(exporter)["open"]
+        assert tool.status.status_code is StatusCode.UNSET
+        assert tool.attributes["launchdarkly.stream.abandoned"] is True
+        assert "error.type" not in tool.attributes

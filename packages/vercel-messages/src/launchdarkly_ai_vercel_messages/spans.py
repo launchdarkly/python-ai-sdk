@@ -78,8 +78,16 @@ def mark_ok(span: Any) -> None:
     span.set_status(StatusCode.OK)
 
 
-def fail_span(span: Any, error: BaseException, tracker: set[int] | None = None) -> None:
+def fail_span(
+    span: Any,
+    error: BaseException,
+    tracker: set[int] | None = None,
+    *,
+    error_type: str | None = None,
+) -> None:
     span.record_exception(error)
+    if error_type is not None:
+        span.set_attribute("error.type", error_type)
     span.set_status(StatusCode.ERROR, str(error))
     if tracker is None or id(span) not in tracker:
         if tracker is not None:

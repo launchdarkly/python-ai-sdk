@@ -215,6 +215,7 @@ requested name. See section 2a.
 | `gen_ai.tool.call.id` | provider's tool call id |
 | `gen_ai.tool.call.arguments` | gated. See section 7 |
 | `gen_ai.tool.call.result` | gated. See section 7 |
+| `error.type` | `tool_error`, on an ERROR span only. See section 6 |
 
 No usage attributes. A tool call spends no tokens.
 
@@ -357,6 +358,13 @@ leaves the attribute off instead of asserting that the turn finished for no reas
 
 Record the exception on the innermost open span, set its status to ERROR with the exception
 message, and end it. Then do the same to the root, but write the run's usage to the root first.
+
+An `execute_tool` span that ends ERROR also gets `error.type` `tool_error`, whatever ended it: the
+tool raised, the tool was not offered, its result could not be recorded, or the run failed while the
+call was open. It means the call ended in error, not that the tool itself faulted. An ERROR tool
+span writes no `gen_ai.tool.call.result`, even with capture on, and even when the handler answers
+the failure to the model and keeps running. An OK span, or one ended UNSET by abandonment or
+cancellation, never carries `error.type`.
 
 Partial spend survives a failed run. That is the whole point of tracking whether any turn reported
 usage.

@@ -1028,3 +1028,96 @@ class TestUnofferedToolsFailClosed:
             else:
                 await _events(await handler.stream(config, "q", handlers))
         privileged.assert_not_awaited()
+
+
+def _exported_spans() -> Any:
+    """A real TracerProvider and InMemorySpanExporter behind the handler's tracer lookup."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return patch.object(trace, "get_tracer", provider.get_tracer), exporter
+
+
+def _tool_spans(exporter: Any) -> dict[str, Any]:
+    return {
+        s.attributes["gen_ai.tool.name"]: s
+        for s in exporter.get_finished_spans()
+        if s.name.startswith("execute_tool")
+    }
+
+
+_GOOD_BAD_CONFIG = {
+    **CONFIG,
+    "tools": {
+        "good": {"description": "good", "parameters": {}},
+        "bad": {"description": "bad", "parameters": {}},
+    },
+}
+
+
+def _good_bad_completion() -> AsyncMock:
+    calls = [_tool_call("good", "c1", "{}"), _tool_call("bad", "c2", "{}")]
+    return AsyncMock(return_value=_response(None, tool_calls=calls))
+
+
+class TestFailedToolSpanErrorType:
+    """TELEMETRY-CONTRACT.md sections 4 and 6: an ERROR tool span carries `error.type`
+    `tool_error` and no result; an OK or cancelled one carries no `error.type`.
+
+    The blocking and streaming paths share ``_execute_tools``, its one tool failure site."""
+
+    async def test_marks_only_the_failed_call(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        bad = AsyncMock(side_effect=RuntimeError("tool exploded"))
+        h = create_litellm_messages_handler(
+            completion=_good_bad_completion(), capture_content=True
+        )
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(RuntimeError, match="tool exploded"):
+            await h(
+                _GOOD_BAD_CONFIG,
+                "q",
+                {"good": AsyncMock(return_value="fine"), "bad": bad},
+            )
+
+        tools = _tool_spans(exporter)
+        good, failed = tools["good"], tools["bad"]
+        assert good.status.status_code is StatusCode.OK
+        assert "error.type" not in good.attributes
+        assert good.attributes["gen_ai.tool.call.result"] == "fine"
+        assert failed.status.status_code is StatusCode.ERROR
+        assert failed.attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in failed.attributes
+
+    async def test_a_cancelled_tool_call_gets_no_error_type(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        h = create_litellm_messages_handler(
+            completion=_good_bad_completion(), capture_content=True
+        )
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(asyncio.CancelledError):
+            await h(
+                _GOOD_BAD_CONFIG,
+                "q",
+                {
+                    "good": AsyncMock(side_effect=asyncio.CancelledError()),
+                    "bad": AsyncMock(side_effect=asyncio.CancelledError()),
+                },
+            )
+
+        tools = _tool_spans(exporter)
+        assert set(tools) == {"good", "bad"}
+        for tool in tools.values():
+            assert tool.status.status_code is StatusCode.UNSET
+            assert "error.type" not in tool.attributes
+            assert tool.attributes.get("launchdarkly.run.cancelled") is True
+            assert "launchdarkly.stream.abandoned" not in tool.attributes

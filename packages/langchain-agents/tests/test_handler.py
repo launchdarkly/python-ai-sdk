@@ -2876,3 +2876,110 @@ class TestConnectionConfigIsNeverForwarded:
         assert "api_key" not in kwargs
         assert "base_url" not in kwargs
         assert kwargs["temperature"] == 0.3
+
+
+def _exported_spans() -> Any:
+    """A real TracerProvider and InMemorySpanExporter behind the handler's tracer lookup."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return patch.object(trace, "get_tracer", provider.get_tracer), exporter
+
+
+def _tool_spans(exporter: Any) -> dict[str, Any]:
+    return {
+        s.attributes["gen_ai.tool.name"]: s
+        for s in exporter.get_finished_spans()
+        if s.name.startswith("execute_tool")
+    }
+
+
+_GOOD_BAD_CONFIG: dict[str, Any] = {
+    **BASE_CONFIG,
+    "tools": {
+        name: {"description": name, "parameters": {"type": "object", "properties": {}}}
+        for name in ("good", "bad")
+    },
+}
+
+
+class TestFailedToolSpanErrorType:
+    """TELEMETRY-CONTRACT.md sections 4 and 6: an ERROR tool span carries `error.type`
+    `tool_error` and no result; an OK or abandoned one carries no `error.type`."""
+
+    @pytest.mark.asyncio
+    async def test_marks_only_the_failed_call(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        async def _good(_args: Any) -> str:
+            return "fine"
+
+        async def _bad(_args: Any) -> str:
+            raise RuntimeError("tool exploded")
+
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(tool_calls=[{"name": "good", "args": {}, "id": "c1"}]),
+                _ai_message(tool_calls=[{"name": "bad", "args": {}, "id": "c2"}]),
+            ]
+        )
+        ctx, exporter = _exported_spans()
+        with ctx, pytest.raises(Exception, match="tool exploded"):
+            await create_langchain_agents_handler(llm, capture_content=True)(
+                _GOOD_BAD_CONFIG, "q", {"good": _good, "bad": _bad}
+            )
+
+        tools = _tool_spans(exporter)
+        good, bad = tools["good"], tools["bad"]
+        assert good.status.status_code is StatusCode.OK
+        assert "error.type" not in good.attributes
+        assert good.attributes["gen_ai.tool.call.result"] == "fine"
+        assert bad.status.status_code is StatusCode.ERROR
+        assert bad.attributes["error.type"] == "tool_error"
+        assert "gen_ai.tool.call.result" not in bad.attributes
+
+    @pytest.mark.asyncio
+    async def test_teardown_and_unrecordable_results_are_marked(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_langchain_agents.spans import build_span_callbacks
+
+        ctx, exporter = _exported_spans()
+        with ctx:
+            callbacks = build_span_callbacks(BASE_CONFIG, None, capture_content=True)
+            handler = callbacks._handler
+            await handler.on_tool_start({"name": "unrecordable"}, "{}", run_id="r1")
+            with pytest.raises(TypeError):
+                await handler.on_tool_end(object(), run_id="r1")
+            await handler.on_tool_start({"name": "open"}, "{}", run_id="r2")
+            callbacks.close_open_spans(RuntimeError("run failed"))
+
+        for span in _tool_spans(exporter).values():
+            assert span.status.status_code is StatusCode.ERROR
+            assert span.attributes["error.type"] == "tool_error"
+            assert "gen_ai.tool.call.result" not in span.attributes
+        assert set(_tool_spans(exporter)) == {"unrecordable", "open"}
+
+    @pytest.mark.asyncio
+    async def test_an_abandoned_call_gets_no_error_type(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_langchain_agents.spans import build_span_callbacks
+
+        ctx, exporter = _exported_spans()
+        with ctx:
+            callbacks = build_span_callbacks(BASE_CONFIG, None, capture_content=True)
+            await callbacks._handler.on_tool_start({"name": "open"}, "{}", run_id="r1")
+            callbacks.abandon_open_spans(set())
+
+        tool = _tool_spans(exporter)["open"]
+        assert tool.status.status_code is StatusCode.UNSET
+        assert tool.attributes["launchdarkly.stream.abandoned"] is True
+        assert "error.type" not in tool.attributes

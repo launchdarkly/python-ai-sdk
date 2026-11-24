@@ -378,8 +378,12 @@ def _succeed_span(span: Any, ended: set[int]) -> None:
     end_span_once(span, ended)
 
 
-def _fail_span(span: Any, error: BaseException, ended: set[int]) -> None:
+def _fail_span(
+    span: Any, error: BaseException, ended: set[int], *, error_type: str | None = None
+) -> None:
     span.record_exception(error)
+    if error_type is not None:
+        span.set_attribute("error.type", error_type)
     span.set_status(StatusCode.ERROR, str(error))
     end_span_once(span, ended)
 
@@ -441,10 +445,12 @@ async def _execute_tools(
                 "content": content,
             }
         except Exception as exc:
-            _fail_span(span, exc, ended)
+            _fail_span(span, exc, ended, error_type="tool_error")
             raise
         finally:
-            end_span_once(span, ended, abandoned=True)
+            # Only a BaseException (in practice CancelledError) reaches here with the span open:
+            # a generator cannot be abandoned while awaiting a tool.
+            end_span_once(span, ended, cancelled=True)
 
     return await asyncio.gather(*(execute(call) for call in calls))
 

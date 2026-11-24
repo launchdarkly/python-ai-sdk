@@ -528,7 +528,7 @@ async def _run_tool_loop(
                     succeed_span(tool_span)
                     open_tool_span = None
                 except Exception as exc:
-                    fail_span(tool_span, exc)
+                    fail_span(tool_span, exc, error_type="tool_error")
                     open_tool_span = None
                     raise
                 tool_results.append(
@@ -926,7 +926,7 @@ async def _stream_gen(
                     succeed_span(tool_span)
                     open_tool_span = None
                 except Exception as exc:
-                    fail_span(tool_span, exc, ended)
+                    fail_span(tool_span, exc, ended, error_type="tool_error")
                     open_tool_span = None
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:

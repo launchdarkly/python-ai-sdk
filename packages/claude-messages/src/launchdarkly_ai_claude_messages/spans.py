@@ -164,7 +164,13 @@ def mark_ok(span: Any) -> None:
     span.set_status(SpanStatusCode.OK)
 
 
-def fail_span(span: Any, error: BaseException, tracker: set[int] | None = None) -> None:
+def fail_span(
+    span: Any,
+    error: BaseException,
+    tracker: set[int] | None = None,
+    *,
+    error_type: str | None = None,
+) -> None:
     """Records the exception, sets ERROR, and ends the span.
 
     *tracker* is passed only from the streaming path, where a ``finally`` may race this to the same
@@ -173,6 +179,8 @@ def fail_span(span: Any, error: BaseException, tracker: set[int] | None = None) 
     if span is None:
         return
     span.record_exception(error)
+    if error_type is not None:
+        span.set_attribute("error.type", error_type)
     span.set_status(SpanStatusCode.ERROR, str(error))
     if tracker is not None:
         from launchdarkly_ai_server import end_span_once
