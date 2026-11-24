@@ -2946,7 +2946,9 @@ class TestToolSpanSurvivesAContentFailure:
         # so the span was untracked and unended: never exported, and a reader saw a tool that started
         # and never returned.
         class Unserialisable:
-            pass
+            def __repr__(self) -> str:
+                # JSON falls back to str(), which uses repr(); it has to raise too.
+                raise TypeError("not renderable")
 
         async def _query(**kwargs: Any) -> AsyncIterator[Any]:
             yield init_message("s1")
@@ -2988,7 +2990,9 @@ class TestToolSpanSurvivesAContentFailure:
         # The start hook wrote content before filing the span. A raise there left a span nothing knew
         # about, so neither close_open_spans nor the teardown could ever end it.
         class Unserialisable:
-            pass
+            def __repr__(self) -> str:
+                # JSON falls back to str(), which uses repr(); it has to raise too.
+                raise TypeError("not renderable")
 
         async def _query(**kwargs: Any) -> AsyncIterator[Any]:
             yield init_message("s1")

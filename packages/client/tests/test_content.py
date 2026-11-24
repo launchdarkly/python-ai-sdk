@@ -602,7 +602,61 @@ class TestToolCallContentAttributes:
     def test_anything_else_becomes_json(self) -> None:
         span = FakeSpan()
         set_tool_call_content_attributes(span, True, arguments={"city": "NYC"})
-        assert span.attributes["gen_ai.tool.call.arguments"] == '{"city": "NYC"}'
+        assert span.attributes["gen_ai.tool.call.arguments"] == '{"city":"NYC"}'
+
+    def test_the_shared_encoding_vector(self) -> None:
+        # The shared vector: compact JSON, raw UTF-8, no HTML escaping.
+        span = FakeSpan()
+        set_tool_call_content_attributes(
+            span, True, arguments={"city": "Zürich", "q": "a<b"}, result={"s": "<a>&"}
+        )
+        assert (
+            span.attributes["gen_ai.tool.call.arguments"]
+            == '{"city":"Zürich","q":"a<b"}'
+        )
+        assert span.attributes["gen_ai.tool.call.result"] == '{"s":"<a>&"}'
+
+    def test_a_string_result_is_written_unchanged(self) -> None:
+        span = FakeSpan()
+        set_tool_call_content_attributes(span, True, result="a<b")
+        assert span.attributes["gen_ai.tool.call.result"] == "a<b"
+
+    def test_a_none_result_writes_no_attribute(self) -> None:
+        span = FakeSpan()
+        set_tool_call_content_attributes(span, True, arguments={"a": 1}, result=None)
+        assert "gen_ai.tool.call.result" not in span.attributes
+
+    def test_a_result_json_cannot_encode_falls_back_to_str_without_raising(
+        self,
+    ) -> None:
+        cycle: dict = {}
+        cycle["self"] = cycle
+        span = FakeSpan()
+        set_tool_call_content_attributes(span, True, result=cycle)
+        assert span.attributes["gen_ai.tool.call.result"] == str(cycle)
+
+    def test_a_cycle_behind_an_unencodable_value_falls_back_to_str(self) -> None:
+        # The set raises first (TypeError), so the cycle is only ever met by str().
+        mixed: dict[str, Any] = {"s": {1, 2}}
+        mixed["self"] = mixed
+        span = FakeSpan()
+        set_tool_call_content_attributes(span, True, arguments=mixed, result=mixed)
+        assert span.attributes["gen_ai.tool.call.arguments"] == str(mixed)
+        assert (
+            span.attributes["gen_ai.tool.call.result"] == "{'s': {1, 2}, 'self': {...}}"
+        )
+
+    def test_nan_and_infinity_take_the_str_fallback_not_bare_json_tokens(
+        self,
+    ) -> None:
+        span = FakeSpan()
+        set_tool_call_content_attributes(
+            span, True, arguments={"x": float("nan")}, result=float("inf")
+        )
+        assert span.attributes["gen_ai.tool.call.arguments"] == "{'x': nan}"
+        assert span.attributes["gen_ai.tool.call.result"] == "inf"
+        assert tool_result_string(float("-inf")) == "-inf"
+        assert tool_result_string([float("nan")]) == "[nan]"
 
     def test_writes_only_the_side_it_was_given(self) -> None:
         span = FakeSpan()
@@ -623,9 +677,9 @@ def test_tool_result_string_passes_strings_maps_none_to_empty_and_json_encodes_t
     assert tool_result_string(None) == ""
     assert (
         tool_result_string({"temp": 72, "city": "Zürich"})
-        == '{"temp": 72, "city": "Zürich"}'
+        == '{"temp":72,"city":"Zürich"}'
     )
-    assert tool_result_string([1, "two"]) == '[1, "two"]'
+    assert tool_result_string([1, "two"]) == '[1,"two"]'
     assert tool_result_string(3) == "3"
 
 

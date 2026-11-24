@@ -31,6 +31,7 @@ from launchdarkly_ai_server import (
     set_usage_span_attributes,
     text_message,
     to_semconv_finish_reason,
+    tool_result_string,
     validate_max_retries,
 )
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -433,7 +434,7 @@ async def _execute_tools(
             result = await _invoke_tool(handler, arguments)
             if capture_content:
                 set_tool_call_content_attributes(span, True, result=result)
-            content = result if isinstance(result, str) else json.dumps(result)
+            content = tool_result_string(result)
             _succeed_span(span, ended)
             return {
                 "role": "tool",
