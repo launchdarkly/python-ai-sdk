@@ -294,15 +294,15 @@ def_obj = await resolve_graph(
     context={"kind": "user", "key": "user-123"},
 )
 
-if def_obj["enabled"]:
+if def_obj.enabled:
     # Walk root → leaves
     async def visitor(node, ctx):
-        print(node["key"], node["config"])
+        print(node.key, node.config)
 
-    await def_obj["traverse"](visitor)
+    await def_obj.traverse(visitor)
 
     # Or leaves → root
-    await def_obj["reverse_traverse"](visitor)
+    await def_obj.reverse_traverse(visitor)
 ```
 
 `GraphDefinition` also exposes `get_node`, `get_child_nodes`, `get_parent_nodes`, `terminal_nodes`, `edges_from`, `run_node`, and `route` for fine-grained control.
@@ -359,6 +359,8 @@ result = await to_litellm_agents(
 
 Uses a pre-order traversal (root → leaves) to build a compiled `StateGraph`. Single-child edges become direct edges; multi-child edges use `Command`-returning handoff tools so the model picks exactly one target.
 
+Without a `model_factory`, each node gets the same model the LangChain handler builds for that node's config, chosen by its `provider.name` (`ChatAnthropic` for `anthropic`, `ChatBedrockConverse` for `bedrock`, and `ChatOpenAI` for any other provider), so one graph can mix providers. A node's provider needs its extra installed, as in [Install](#1-install).
+
 ```python
 from launchdarkly_ai_server import resolve_graph
 from launchdarkly_ai_langchain_agents import to_lang_graph
@@ -370,7 +372,7 @@ result = await to_lang_graph(
         "tool_handlers": registry.tools,
         "context": ctx,
         # optional: supply your own model per node
-        "model_factory": lambda node: ChatOpenAI(model=node["config"]["model"]["name"]),
+        "model_factory": lambda node: ChatOpenAI(model=node.config["model"]["name"]),
     },
 ).invoke("I was double charged")
 ```

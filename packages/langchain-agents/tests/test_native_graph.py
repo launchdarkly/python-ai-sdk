@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1779,3 +1779,451 @@ class TestToolsFailClosed:
             }
         )
         assert self._offered(lambda: _build_node_tools(node, self.HANDLERS)) == ["safe"]
+
+
+# ---------------------------------------------------------------------------
+# Default model per node follows the node config's provider
+# ---------------------------------------------------------------------------
+
+
+def _provider_node(
+    key: str,
+    provider: str | None,
+    model: dict[str, Any],
+    edges: list[str] | None = None,
+) -> dict[str, Any]:
+    config: dict[str, Any] = {"model": model, "instructions": f"you are {key}"}
+    if provider is not None:
+        config["provider"] = {"name": provider}
+    return {
+        "key": key,
+        "config": config,
+        "meta": {"variationKey": "v1", "version": 1},
+        "edges": [{"source_key": key, "target_key": c} for c in edges or []],
+        "is_terminal": not edges,
+    }
+
+
+def _single_node_graph(provider: str | None, model: dict[str, Any]) -> GraphDefinition:
+    return _make_graph_def(nodes={"root": _provider_node("root", provider, model)})
+
+
+def _provider_mocks(mocks: dict[str, Any]) -> tuple[MagicMock, MagicMock]:
+    """Adds mocked ``langchain_anthropic`` and ``langchain_aws`` modules whose constructors
+    return the same mock chat model the ``ChatOpenAI`` mock does."""
+    anthropic_ctor = MagicMock(return_value=mocks["_chat_model"])
+    bedrock_ctor = MagicMock(return_value=mocks["_chat_model"])
+    mocks["langchain_anthropic"] = MagicMock(ChatAnthropic=anthropic_ctor)
+    mocks["langchain_aws"] = MagicMock(ChatBedrockConverse=bedrock_ctor)
+    return anthropic_ctor, bedrock_ctor
+
+
+class TestNativeGraphDefaultModelFollowsProvider:
+    """Without a ``model_factory``, each node's model comes from the handler's
+    ``_make_default_chat_model``, so a graph node gets the class, forwarded parameters and
+    install hint a single-agent call on the same config would get."""
+
+    @pytest.mark.asyncio
+    async def test_anthropic_node_builds_chat_anthropic(self) -> None:
+        mocks = _make_langgraph_mocks(_make_ai_msg("final"))
+        anthropic_ctor, bedrock_ctor = _provider_mocks(mocks)
+        graph_def = _single_node_graph(
+            "Anthropic",
+            {
+                "name": "claude-sonnet-4-5",
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens_to_sample": 512,
+                    "stop": ["END"],
+                    "frequency_penalty": 0.5,
+                },
+            },
+        )
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        anthropic_ctor.assert_called_once()
+        assert anthropic_ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "stop_sequences": ["END"],
+            "model": "claude-sonnet-4-5",
+        }
+        mocks["langchain_openai"].ChatOpenAI.assert_not_called()
+        bedrock_ctor.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bedrock_node_builds_chat_bedrock_converse(self) -> None:
+        mocks = _make_langgraph_mocks(_make_ai_msg("final"))
+        anthropic_ctor, bedrock_ctor = _provider_mocks(mocks)
+        graph_def = _single_node_graph(
+            "Bedrock",
+            {
+                "name": "anthropic.claude-sonnet-4-5",
+                "region": "us",
+                "parameters": {"temperature": 0.1, "stop": ["END"], "top_k": 5},
+            },
+        )
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        bedrock_ctor.assert_called_once()
+        assert bedrock_ctor.call_args.kwargs == {
+            "temperature": 0.1,
+            "stop_sequences": ["END"],
+            "model": "us.anthropic.claude-sonnet-4-5",
+        }
+        mocks["langchain_openai"].ChatOpenAI.assert_not_called()
+        anthropic_ctor.assert_not_called()
+
+    @pytest.mark.parametrize("provider", ["OpenAI", "", None])
+    @pytest.mark.asyncio
+    async def test_openai_or_empty_provider_node_keeps_chat_openai(
+        self, provider: str | None
+    ) -> None:
+        mocks = _make_langgraph_mocks(_make_ai_msg("final"))
+        anthropic_ctor, bedrock_ctor = _provider_mocks(mocks)
+        graph_def = _single_node_graph(
+            provider, {"name": "gpt-4o", "parameters": {"temperature": 0.3}}
+        )
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        assert mocks["langchain_openai"].ChatOpenAI.call_args.kwargs == {
+            "temperature": 0.3,
+            "model": "gpt-4o",
+        }
+        anthropic_ctor.assert_not_called()
+        bedrock_ctor.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_each_node_follows_its_own_provider(self) -> None:
+        mocks = _make_langgraph_mocks(_make_ai_msg("final"))
+        anthropic_ctor, bedrock_ctor = _provider_mocks(mocks)
+        nodes = {
+            "router": _provider_node(
+                "router",
+                "Anthropic",
+                {"name": "claude-sonnet-4-5"},
+                edges=["billing", "support"],
+            ),
+            "billing": _provider_node(
+                "billing", "Bedrock", {"name": "anthropic.claude-haiku-4-5"}
+            ),
+            "support": _provider_node("support", "OpenAI", {"name": "gpt-4o-mini"}),
+        }
+        graph_def = _make_graph_def(
+            nodes=nodes,
+            edges=[
+                {"source_key": "router", "target_key": "billing"},
+                {"source_key": "router", "target_key": "support"},
+            ],
+            root_key="router",
+        )
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        assert [c.kwargs["model"] for c in anthropic_ctor.call_args_list] == [
+            "claude-sonnet-4-5"
+        ]
+        assert [c.kwargs["model"] for c in bedrock_ctor.call_args_list] == [
+            "anthropic.claude-haiku-4-5"
+        ]
+        assert [
+            c.kwargs["model"]
+            for c in mocks["langchain_openai"].ChatOpenAI.call_args_list
+        ] == ["gpt-4o-mini"]
+
+    @pytest.mark.parametrize("provider", ["Anthropic", "Bedrock", "OpenAI"])
+    @pytest.mark.asyncio
+    async def test_model_factory_wins_over_the_provider_default(
+        self, provider: str
+    ) -> None:
+        mocks = _make_langgraph_mocks(_make_ai_msg("from-factory"))
+        anthropic_ctor, bedrock_ctor = _provider_mocks(mocks)
+        seen: list[str] = []
+        custom = MagicMock()
+        custom.ainvoke = AsyncMock(return_value=_make_ai_msg("from-factory"))
+        custom.bind_tools = MagicMock(return_value=custom)
+
+        def factory(node: GraphNode) -> Any:
+            seen.append(node.key)
+            return custom
+
+        graph_def = _single_node_graph(provider, {"name": "m"})
+
+        with _patch_imports(mocks):
+            result = await to_lang_graph(
+                _make_def_promise(graph_def), {"model_factory": factory}
+            ).invoke("hi")
+
+        assert result["response"] == "from-factory"
+        assert seen == ["root"]
+        anthropic_ctor.assert_not_called()
+        bedrock_ctor.assert_not_called()
+        mocks["langchain_openai"].ChatOpenAI.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("provider", "module", "extra"),
+        [
+            ("Anthropic", "langchain_anthropic", "anthropic"),
+            ("Bedrock", "langchain_aws", "aws"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_missing_extra_raises_the_install_hint(
+        self, provider: str, module: str, extra: str
+    ) -> None:
+        """A missing optional package fails the run, not the build: ``invoke()`` raises the
+        install hint with the import error as its cause, tracks the invocation failure, and ends
+        the ``launchdarkly.graph`` span with ERROR."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
+        mocks = _make_langgraph_mocks(_make_ai_msg("final"))
+        # A None entry in sys.modules makes the import raise ModuleNotFoundError.
+        mocks[module] = None
+        fake_trace, exporter, end_spies = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        client = MagicMock()
+        client.track = MagicMock(
+            side_effect=lambda evt, _ctx, data, _val: track_calls.append((evt, data))
+        )
+        graph_def = _single_node_graph(provider, {"name": "m"})
+        runner = to_lang_graph(
+            _make_def_promise(graph_def), {"context": {"kind": "user", "key": "u"}}
+        )
+
+        with (
+            _patch_imports(mocks),
+            patch.object(ng_mod, "trace", fake_trace),
+            patch.object(ng_mod, "_HAS_OTEL", True),
+            patch.object(ng_mod, "get_client", return_value=client),
+        ):
+            with pytest.raises(
+                ImportError,
+                match=rf"pip install \"launchdarkly-ai-langchain-agents\[{extra}\]\"",
+            ) as raised:
+                await runner.invoke("hi")
+
+        assert isinstance(raised.value.__cause__, ImportError)
+        mocks["langchain_openai"].ChatOpenAI.assert_not_called()
+        _assert_one_failed_graph_span(
+            exporter, end_spies, str(raised.value), track_calls
+        )
+
+
+class TestNativeGraphRealProviderModels:
+    """The real ``ChatAnthropic`` and ``ChatBedrockConverse`` classes, built by the default
+    path, run a hand-off through a real ``StateGraph``. Only the provider call is replaced, so
+    tool binding (including the hand-off tool's injected call id) and, for Anthropic, request
+    formatting of the neutral history run as they would against the API."""
+
+    @staticmethod
+    def _script(cls: Any, replies: list[Any], payloads: list[Any] | None) -> Any:
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        queue = list(replies)
+
+        async def _agenerate(
+            self: Any, messages: list[Any], stop: Any = None, **kwargs: Any
+        ) -> Any:
+            if payloads is not None:
+                payloads.append(
+                    self._get_request_payload(messages, stop=stop, **kwargs)
+                )
+            return ChatResult(generations=[ChatGeneration(message=queue.pop(0))])
+
+        return patch.object(cls, "_agenerate", _agenerate)
+
+    @staticmethod
+    def _graph(provider: str, model: str) -> GraphDefinition:
+        return _make_graph_def(
+            nodes={
+                "router": _provider_node(
+                    "router", provider, {"name": model}, edges=["butler", "cook"]
+                ),
+                "butler": _provider_node("butler", provider, {"name": model}),
+                "cook": _provider_node("cook", provider, {"name": model}),
+            },
+            edges=[
+                {"source_key": "router", "target_key": "butler"},
+                {"source_key": "router", "target_key": "cook"},
+            ],
+            root_key="router",
+        )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_nodes_hand_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lc_anthropic = pytest.importorskip("langchain_anthropic")
+        from langchain_core.messages import AIMessage
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        payloads: list[Any] = []
+        replies = [
+            _tool_call_msg(("transfer_to_butler", "toolu_1")),
+            AIMessage(content="the butler did it"),
+        ]
+        with (
+            patch("launchdarkly_ai_langchain_agents.native_graph._HAS_OTEL", False),
+            self._script(lc_anthropic.ChatAnthropic, replies, payloads),
+        ):
+            result = await to_lang_graph(
+                _make_def_promise(self._graph("Anthropic", "claude-sonnet-4-5"))
+            ).invoke("who did it?")
+
+        assert result["response"] == "the butler did it"
+        router_payload, butler_payload = payloads
+        assert router_payload["model"] == "claude-sonnet-4-5"
+        assert router_payload["system"] == "you are router"
+        assert sorted(t["name"] for t in router_payload["tools"]) == [
+            "transfer_to_butler",
+            "transfer_to_cook",
+        ]
+        # The injected call id is not part of the schema the model sees.
+        for t in router_payload["tools"]:
+            assert "tool_call_id" not in t["input_schema"].get("properties", {})
+        assert butler_payload["system"] == "you are butler"
+        assert [m["role"] for m in butler_payload["messages"]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_bedrock_nodes_hand_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lc_aws = pytest.importorskip("langchain_aws")
+        from langchain_core.messages import AIMessage
+
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+        built: list[Any] = []
+        real_init = lc_aws.ChatBedrockConverse.__init__
+
+        def _spy_init(self: Any, *a: Any, **kw: Any) -> None:
+            real_init(self, *a, **kw)
+            built.append(self)
+
+        replies = [
+            _tool_call_msg(("transfer_to_cook", "call_1")),
+            AIMessage(content="the cook did it"),
+        ]
+        with (
+            patch("launchdarkly_ai_langchain_agents.native_graph._HAS_OTEL", False),
+            patch.object(lc_aws.ChatBedrockConverse, "__init__", _spy_init),
+            self._script(lc_aws.ChatBedrockConverse, replies, None),
+        ):
+            result = await to_lang_graph(
+                _make_def_promise(
+                    self._graph("Bedrock", "anthropic.claude-sonnet-4-5-v1:0")
+                )
+            ).invoke("who did it?")
+
+        assert result["response"] == "the cook did it"
+        assert {type(m).__name__ for m in built} == {"ChatBedrockConverse"}
+        assert len(built) == 3
+
+
+class TestNativeGraphMixedProviders:
+    """One graph whose nodes name three providers builds one model of each class, one per
+    node, through a real ``StateGraph``, and the hand-off reaches the second provider with the
+    history rewritten to plain turns."""
+
+    @pytest.mark.asyncio
+    async def test_anthropic_hands_off_to_bedrock_beside_an_openai_node(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lc_anthropic = pytest.importorskip("langchain_anthropic")
+        lc_aws = pytest.importorskip("langchain_aws")
+        import langchain_openai
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+        classes = {
+            "anthropic": lc_anthropic.ChatAnthropic,
+            "bedrock": lc_aws.ChatBedrockConverse,
+            "openai": langchain_openai.ChatOpenAI,
+        }
+        replies: dict[str, list[Any]] = {
+            "anthropic": [_tool_call_msg(("transfer_to_billing", "toolu_1"))],
+            "bedrock": [AIMessage(content="billing fixed it")],
+            "openai": [],
+        }
+        received: dict[str, list[list[Any]]] = {name: [] for name in classes}
+        built: list[str] = []
+
+        def scripted(name: str) -> Any:
+            async def _agenerate(
+                self: Any, messages: list[Any], stop: Any = None, **kwargs: Any
+            ) -> Any:
+                received[name].append(list(messages))
+                return ChatResult(
+                    generations=[ChatGeneration(message=replies[name].pop(0))]
+                )
+
+            return _agenerate
+
+        def spied(name: str, cls: Any) -> Any:
+            real_init = cls.__init__
+
+            def _init(self: Any, *args: Any, **kwargs: Any) -> None:
+                real_init(self, *args, **kwargs)
+                built.append(name)
+
+            return _init
+
+        graph_def = _make_graph_def(
+            nodes={
+                "router": _provider_node(
+                    "router",
+                    "Anthropic",
+                    {"name": "claude-sonnet-4-5"},
+                    edges=["billing", "support"],
+                ),
+                "billing": _provider_node(
+                    "billing", "Bedrock", {"name": "anthropic.claude-haiku-4-5"}
+                ),
+                "support": _provider_node("support", "OpenAI", {"name": "gpt-4o-mini"}),
+            },
+            edges=[
+                {"source_key": "router", "target_key": "billing"},
+                {"source_key": "router", "target_key": "support"},
+            ],
+            root_key="router",
+        )
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("launchdarkly_ai_langchain_agents.native_graph._HAS_OTEL", False)
+            )
+            for name, cls in classes.items():
+                stack.enter_context(patch.object(cls, "_agenerate", scripted(name)))
+                stack.enter_context(patch.object(cls, "__init__", spied(name, cls)))
+            result = await to_lang_graph(_make_def_promise(graph_def)).invoke(
+                "my invoice is wrong"
+            )
+
+        assert result["response"] == "billing fixed it"
+        assert sorted(built) == ["anthropic", "bedrock", "openai"]
+        assert len(received["anthropic"]) == 1
+        assert received["openai"] == []
+        (billing_messages,) = received["bedrock"]
+        # The router's turns reach Bedrock as plain text, with no function calls to replay.
+        assert not any(getattr(m, "tool_calls", None) for m in billing_messages)
+        assert any(
+            type(m).__name__ == "HumanMessage"
+            and "my invoice is wrong" in str(m.content)
+            for m in billing_messages
+        )
